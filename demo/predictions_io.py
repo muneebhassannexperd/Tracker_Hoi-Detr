@@ -11,12 +11,13 @@ A detection is exported with only these fields:
     score      detection confidence (0-1)
     class_id   0=hand, 1=firstobject, 2=secondobject
     class_name string form of class_id
+    track_id   optional int from the video tracker (None / omitted if absent)
 
 Interactions (hf, fs) reference their two endpoints by index into the
 frame/image `detections` list, plus the interaction prob -- no detection
 data is duplicated. Render-only keys that draw_ui attaches in place
 (draw_box, label_prefer, coincident_inner/outer) and internal fields
-(center, query_idx) are intentionally dropped.
+(center, query_idx, embedding) are intentionally dropped.
 """
 
 import numpy as np
@@ -25,12 +26,16 @@ import numpy as np
 # ── export ────────────────────────────────────────────────────
 def det_to_jsonable(d):
     """Whitelist the meaningful fields of a detection dict for JSON."""
-    return {
+    out = {
         'box':        [float(x) for x in d['box']],   # xyxy, original-image px
         'score':      float(d['score']),
         'class_id':   int(d['class_id']),
         'class_name': d['class_name'],
     }
+    if 'track_id' in d:
+        tid = d['track_id']
+        out['track_id'] = int(tid) if tid is not None else None
+    return out
 
 
 def detections_record(dets, hf, fs):
@@ -66,13 +71,17 @@ def load_detections(det_json):
         box = np.array(d['box'], dtype=np.float32)
         cx  = int((box[0] + box[2]) / 2)
         cy  = int((box[1] + box[3]) / 2)
-        dets.append(dict(
+        item = dict(
             box        = box,
             score      = float(d['score']),
             class_id   = int(d['class_id']),
             class_name = d['class_name'],
             center     = (cx, cy),
-        ))
+        )
+        if 'track_id' in d:
+            tid = d['track_id']
+            item['track_id'] = int(tid) if tid is not None else None
+        dets.append(item)
     return dets
 
 

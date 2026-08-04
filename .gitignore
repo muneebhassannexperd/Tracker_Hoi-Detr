@@ -1,1 +1,83 @@
+# OS / editor
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights / checkpoints
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.weights
+*.bin
+*.safetensors
+
+# Local data / media dumps
+Test-Data/
+Data/
+data/
+datasets/
+raw_data/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+# Keep small demo examples already shipped with the repo.
+!demo/example_videos/*.mp4
+
+# Outputs / runs / logs
+Output/
+output/
+outputs/
+demo/results/
+results/
+work_dirs/
+runs/
+wandb/
+*.log
+logs/
+
+# Temp / misc
+tmp/
+temp/
+*.tmp
+*.bak
+*.cache
+.cache/
+
+# HybridSORT local artifacts (if any appear later)
+external/**/YOLOX_outputs/
+external/**/pretrained/
+external/**/datasets/

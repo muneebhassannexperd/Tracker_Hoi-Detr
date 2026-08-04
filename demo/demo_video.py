@@ -1,13 +1,14 @@
 """
 demo_video.py
 -------------
-Co-DETR hand-object interaction demo for videos.
+Co-DETR hand-object interaction demo for videos, with Hybrid-SORT tracking.
 
-Takes a folder of mp4 videos and writes annotated mp4 videos to an output
-folder, processing frame-by-frame with the same HOI pipeline as demo.py.
+Takes a folder of videos and writes annotated mp4 videos to an output
+folder, processing frame-by-frame with HOI detection + Deep Hybrid SORT
+(Hybrid-SORT-ReID using HOI decoder embeddings as appearance features).
 
-Also writes a per-video JSON file capturing detections and interactions
-for every frame, alongside the mp4.
+Also writes a per-video JSON file capturing detections, track IDs, and
+interactions for every frame, alongside the mp4.
 
 Edit the variables at the top for your paths, then run:
     python demo/demo_video.py
@@ -16,10 +17,14 @@ Edit the variables at the top for your paths, then run:
 import glob
 import json
 import os
+import sys
 
 import cv2
 import mmcv
 from tqdm import tqdm
+
+# Make demo/ importable for hoi_trackers when run as `python demo/demo_video.py`
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mmdet.apis               import init_detector
 from mmdet.datasets.pipelines import Compose
@@ -35,6 +40,7 @@ from helpers import (
     draw_ui,
 )
 from predictions_io import detections_record
+from hoi_trackers import build_tracker
 
 
 # ══════════════════════════════════════════════════════════════
@@ -44,13 +50,12 @@ MODEL_CONFIG = 'projects/configs/co_dino_vit/co_dino_5scale_vit_large_coco_with_
 CHECKPOINT   = 'checkpoints/epoch_5.pth'
 DEVICE       = 'cuda:0'
 
-# Input: a directory of mp4 videos (any folder name; final path segment is
-# reused in the default output directory).
-INPUT_DIR    = 'demo/example_videos'
+# Input: a directory of videos (searched recursively for nested folders).
+INPUT_DIR    = 'Test-Data/a0572235-5c2c-4b87-8b1b-21497ec349a2'
 
 # Output: None  -> demo/results/<basename(INPUT_DIR)>/  (recommended)
-#         str   -> use that exact directory
-OUTPUT_DIR   = None
+#         str   -> use that exact directory (relative paths preserved)
+OUTPUT_DIR   = 'Output'
 
 # Detection thresholds
 SCORE_THR    = 0.3
@@ -79,13 +84,39 @@ FOURCC = 'mp4v'
 # JSON can be re-rendered later with vis_offline.py.
 EXPORT_JSON = True
 
+# Tracker backend.
+#   'hybrid_sort_reid' / 'deep_hybrid_sort' -> Hybrid-SORT-ReID (Deep Hybrid SORT)
+#       uses HOI-DETR decoder embeddings as appearance features
+#   'hybrid_sort'                           -> Hybrid-SORT (TCM / weak cues only)
+#   None / 'none'                           -> tracking disabled
+TRACKER      = 'hybrid_sort_reid'
+# Keep lost Hybrid tracks a bit; stable IDs are managed separately now.
+TRACK_MAX_AGE = 60
+TRACK_MIN_HITS = 1
+TRACK_IOU_THR = 0.15
+TRACK_MATCH_IOU = 0.1
+TRACK_INERTIA = 0.05
+TRACK_ASSO = 'Height_Modulated_IoU'
+TRACK_EG_HIGH = 1.5
+TRACK_EG_LOW = 1.3
+# Bank reclaim OFF by default: passed-object IDs are not reused on new pickups.
+# Only last-frame continuity keeps an ID. Set True only if you need long-gap
+# same-instance rebirth and can tolerate occasional ID recycle.
+TRACK_ALLOW_BANK_RECLAIM = False
+TRACK_RECOVER_HOLD = 60
+TRACK_RECOVER_SIM = 0.65
+TRACK_RECOVER_DIST = 120.0
+# Split continuing tracks when box size jumps (machine shelf ↔ product).
+TRACK_SPLIT_ON_CHANGE = True
+
 
 # ══════════════════════════════════════════════════════════════
 # Per-frame HOI processing (mirrors the loop body in demo.py)
 # ══════════════════════════════════════════════════════════════
-def process_frame(frame, model, test_pipeline, interaction_branch, tmp_path):
+def process_frame(frame, model, test_pipeline, interaction_branch, tmp_path,
+                  tracker=None):
     """
-    Run detection + interaction on a single BGR frame.
+    Run detection + tracking + interaction on a single BGR frame.
     Returns (annotated_frame, dets, hf_inters, fs_inters) so the caller
     can both write the visualisation and log results to JSON.
     """
@@ -105,7 +136,17 @@ def process_frame(frame, model, test_pipeline, interaction_branch, tmp_path):
         return frame, [], [], []
 
     if not dets:
+        if tracker is not None:
+            tracker.update([], frame)
         return frame, [], [], []
+
+    # Attach HOI decoder embeddings for Hybrid-SORT-ReID appearance cues.
+    for d in dets:
+        d['embedding'] = embeds[d['query_idx']].detach().float().cpu().numpy()
+
+    # Assign stable track IDs across frames (pluggable backend).
+    if tracker is not None:
+        dets = tracker.update(dets, frame)
 
     # Predict interactions: all H->F and F->S pairs
     hands   = [d for d in dets if d['class_id'] == 0]
@@ -143,7 +184,10 @@ def process_frame(frame, model, test_pipeline, interaction_branch, tmp_path):
 # Per-video processing
 # ══════════════════════════════════════════════════════════════
 def process_video(video_path, out_path, json_path, model, test_pipeline,
-                  interaction_branch, tmp_path):
+                  interaction_branch, tmp_path, tracker=None):
+    if tracker is not None:
+        tracker.reset()
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[ERROR] cannot open {video_path}")
@@ -175,6 +219,7 @@ def process_video(video_path, out_path, json_path, model, test_pipeline,
             'score_thr':    SCORE_THR,
             'nms_iou':      NMS_IOU,
             'frame_stride': FRAME_STRIDE,
+            'tracker':      None if tracker is None else tracker.name,
             'class_names':  list(CLASS_NAMES),
             'frames':       [],
         }
@@ -193,6 +238,7 @@ def process_video(video_path, out_path, json_path, model, test_pipeline,
                 vis, dets, hf, fs = process_frame(
                     frame, model, test_pipeline,
                     interaction_branch, tmp_path,
+                    tracker=tracker,
                 )
                 last_vis = vis
                 last_dets, last_hf, last_fs = dets, hf, fs
@@ -233,6 +279,17 @@ def process_video(video_path, out_path, json_path, model, test_pipeline,
     return True
 
 
+def collect_videos(input_dir):
+    """Recursively collect video paths under input_dir."""
+    exts = ('.mp4', '.mov', '.avi', '.mkv')
+    videos = []
+    for root, _dirs, files in os.walk(input_dir):
+        for name in files:
+            if os.path.splitext(name)[1].lower() in exts:
+                videos.append(os.path.join(root, name))
+    return sorted(videos)
+
+
 # ══════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════
@@ -243,11 +300,7 @@ def main():
     )
     os.makedirs(out_dir, exist_ok=True)
 
-    # Collect input videos (preserve filenames on output, force .mp4)
-    exts = ('*.mp4', '*.MP4', '*.mov', '*.MOV', '*.avi', '*.mkv')
-    video_list = sorted(
-        f for ext in exts for f in glob.glob(os.path.join(INPUT_DIR, ext))
-    )
+    video_list = collect_videos(INPUT_DIR)
     if not video_list:
         print(f"[ERROR] No videos found in {INPUT_DIR}")
         return
@@ -262,23 +315,49 @@ def main():
     print(f"[INFO] Interaction MLP input dim: "
           f"{interaction_branch.mlp[0].in_features}")
 
+    tracker = build_tracker(
+        TRACKER,
+        det_thresh=SCORE_THR,
+        max_age=TRACK_MAX_AGE,
+        min_hits=TRACK_MIN_HITS,
+        iou_threshold=TRACK_IOU_THR,
+        match_iou=TRACK_MATCH_IOU,
+        inertia=TRACK_INERTIA,
+        asso_func=TRACK_ASSO,
+        eg_weight_high_score=TRACK_EG_HIGH,
+        eg_weight_low_score=TRACK_EG_LOW,
+        recover_hold_frames=TRACK_RECOVER_HOLD,
+        recover_sim_thresh=TRACK_RECOVER_SIM,
+        recover_max_center_dist=TRACK_RECOVER_DIST,
+        allow_bank_reclaim=TRACK_ALLOW_BANK_RECLAIM,
+        split_on_instance_change=TRACK_SPLIT_ON_CHANGE,
+    )
+    print(f"[INFO] Tracker: {tracker}")
+
     # Track temp files so we can delete them all at the end. Each video
     # gets its own scratch image named after the video stem so multiple
     # instances of this script can run in parallel without clashing.
     tmp_paths = []
 
-    # Main loop
+    # Main loop — preserve relative paths under INPUT_DIR in the output tree
     for video_path in tqdm(video_list, desc='videos'):
-        stem      = os.path.splitext(os.path.basename(video_path))[0]
-        out_path  = os.path.join(out_dir, f'{stem}.mp4')
-        json_path = os.path.join(out_dir, f'{stem}.json')
-        tmp_path  = os.path.join(out_dir, f'._frame_tmp_{stem}.jpg')
+        rel = os.path.relpath(video_path, INPUT_DIR)
+        rel_no_ext = os.path.splitext(rel)[0]
+        out_subdir = os.path.join(out_dir, os.path.dirname(rel_no_ext))
+        os.makedirs(out_subdir, exist_ok=True)
+
+        stem      = os.path.basename(rel_no_ext)
+        out_path  = os.path.join(out_subdir, f'{stem}.mp4')
+        json_path = os.path.join(out_subdir, f'{stem}.json')
+        safe_stem = rel_no_ext.replace(os.sep, '_')
+        tmp_path  = os.path.join(out_dir, f'._frame_tmp_{safe_stem}.jpg')
         tmp_paths.append(tmp_path)
 
         try:
             process_video(video_path, out_path, json_path,
                           model, test_pipeline,
-                          interaction_branch, tmp_path)
+                          interaction_branch, tmp_path,
+                          tracker=tracker)
         except Exception as e:
             print(f"[ERROR] {video_path}: {e}")
             continue

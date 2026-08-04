@@ -1,2 +1,0 @@
-mmdet
-projects

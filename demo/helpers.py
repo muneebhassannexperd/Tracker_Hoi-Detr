@@ -356,6 +356,14 @@ def resolve_coincident_boxes(detections):
 # ═════════════════════════════════════════════════════════════
 # RENDERER (top-level)
 # ═════════════════════════════════════════════════════════════
+def _det_label_text(d):
+    """Class (+ optional track id) and score for box labels."""
+    tid = d.get('track_id', None)
+    if tid is not None:
+        return f"{d['class_name']}#{int(tid)} {d['score']:.2f}"
+    return f"{d['class_name']} {d['score']:.2f}"
+
+
 def draw_ui(vis, detections, hf_inters, fs_inters, style,
             verbose_labels=False):
     """
@@ -466,8 +474,8 @@ def draw_ui(vis, detections, hf_inters, fs_inters, style,
         cv2.circle(vis, d['center'], s['dot_radius'],
                 (255, 255, 255), max(1, int(1.25 * s['scale'])), cv2.LINE_AA)
 
-        # Label
-        txt = f"{d['class_name']} {d['score']:.2f}"
+        # Label (includes track_id when the video tracker assigned one)
+        txt = _det_label_text(d)
         (tw, th), bl = cv2.getTextSize(txt, s['det_font'],
                                        s['det_font_sc'], s['det_font_th'])
         lbl_w = tw + 2 * s['det_pad_x']
