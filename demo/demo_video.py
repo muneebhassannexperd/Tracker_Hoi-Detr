@@ -84,12 +84,15 @@ FOURCC = 'mp4v'
 # JSON can be re-rendered later with vis_offline.py.
 EXPORT_JSON = True
 
-# Tracker backend.
+# Tracker backend (swap to compare on the same videos / Output folder).
 #   'hybrid_sort_reid' / 'deep_hybrid_sort' -> Hybrid-SORT-ReID (Deep Hybrid SORT)
 #       uses HOI-DETR decoder embeddings as appearance features
 #   'hybrid_sort'                           -> Hybrid-SORT (TCM / weak cues only)
+#   'cbiou' / 'c_biou'                      -> Roboflow C-BIoU (box-only; needs Py>=3.10)
 #   None / 'none'                           -> tracking disabled
-TRACKER      = 'hybrid_sort_reid'
+TRACKER      = None
+
+# --- Hybrid-SORT knobs (used when TRACKER is hybrid_sort*) ---
 # Keep lost Hybrid tracks a bit; stable IDs are managed separately now.
 TRACK_MAX_AGE = 60
 TRACK_MIN_HITS = 1
@@ -108,6 +111,18 @@ TRACK_RECOVER_SIM = 0.65
 TRACK_RECOVER_DIST = 120.0
 # Split continuing tracks when box size jumps (machine shelf ↔ product).
 TRACK_SPLIT_ON_CHANGE = True
+
+# --- C-BIoU knobs (used when TRACKER is cbiou; paper: b1 < b2) ---
+CBIOU_BUFFER_RATIO_FIRST = 0.1   # small buffer, first association pass
+CBIOU_BUFFER_RATIO_SECOND = 0.3  # larger buffer, second association pass
+CBIOU_LOST_TRACK_BUFFER = 30
+CBIOU_FRAME_RATE = 30.0
+CBIOU_TRACK_ACTIVATION_THR = 0.3   # align with SCORE_THR by default
+CBIOU_MIN_CONSECUTIVE_FRAMES = 1
+CBIOU_IOU_THR_FIRST = 0.2
+CBIOU_IOU_THR_SECOND = 0.5
+CBIOU_IOU_THR_UNCONFIRMED = 0.3
+CBIOU_HIGH_CONF_DET_THR = 0.3
 
 
 # ══════════════════════════════════════════════════════════════
@@ -140,11 +155,11 @@ def process_frame(frame, model, test_pipeline, interaction_branch, tmp_path,
             tracker.update([], frame)
         return frame, [], [], []
 
-    # Attach HOI decoder embeddings for Hybrid-SORT-ReID appearance cues.
+    # Attach HOI decoder embeddings (used by Hybrid-SORT-ReID; ignored by C-BIoU).
     for d in dets:
         d['embedding'] = embeds[d['query_idx']].detach().float().cpu().numpy()
 
-    # Assign stable track IDs across frames (pluggable backend).
+    # Assign track IDs across frames (pluggable: HybridSORT or C-BIoU).
     if tracker is not None:
         dets = tracker.update(dets, frame)
 
@@ -315,23 +330,39 @@ def main():
     print(f"[INFO] Interaction MLP input dim: "
           f"{interaction_branch.mlp[0].in_features}")
 
-    tracker = build_tracker(
-        TRACKER,
-        det_thresh=SCORE_THR,
-        max_age=TRACK_MAX_AGE,
-        min_hits=TRACK_MIN_HITS,
-        iou_threshold=TRACK_IOU_THR,
-        match_iou=TRACK_MATCH_IOU,
-        inertia=TRACK_INERTIA,
-        asso_func=TRACK_ASSO,
-        eg_weight_high_score=TRACK_EG_HIGH,
-        eg_weight_low_score=TRACK_EG_LOW,
-        recover_hold_frames=TRACK_RECOVER_HOLD,
-        recover_sim_thresh=TRACK_RECOVER_SIM,
-        recover_max_center_dist=TRACK_RECOVER_DIST,
-        allow_bank_reclaim=TRACK_ALLOW_BANK_RECLAIM,
-        split_on_instance_change=TRACK_SPLIT_ON_CHANGE,
-    )
+    tracker_key = None if TRACKER is None else str(TRACKER).strip().lower()
+    if tracker_key in ("cbiou", "c_biou", "c-biou", "cb_iou", "cascaded_biou"):
+        tracker = build_tracker(
+            TRACKER,
+            buffer_ratio_first=CBIOU_BUFFER_RATIO_FIRST,
+            buffer_ratio_second=CBIOU_BUFFER_RATIO_SECOND,
+            lost_track_buffer=CBIOU_LOST_TRACK_BUFFER,
+            frame_rate=CBIOU_FRAME_RATE,
+            track_activation_threshold=CBIOU_TRACK_ACTIVATION_THR,
+            minimum_consecutive_frames=CBIOU_MIN_CONSECUTIVE_FRAMES,
+            minimum_iou_threshold_first_assoc=CBIOU_IOU_THR_FIRST,
+            minimum_iou_threshold_second_assoc=CBIOU_IOU_THR_SECOND,
+            minimum_iou_threshold_unconfirmed_assoc=CBIOU_IOU_THR_UNCONFIRMED,
+            high_conf_det_threshold=CBIOU_HIGH_CONF_DET_THR,
+        )
+    else:
+        tracker = build_tracker(
+            TRACKER,
+            det_thresh=SCORE_THR,
+            max_age=TRACK_MAX_AGE,
+            min_hits=TRACK_MIN_HITS,
+            iou_threshold=TRACK_IOU_THR,
+            match_iou=TRACK_MATCH_IOU,
+            inertia=TRACK_INERTIA,
+            asso_func=TRACK_ASSO,
+            eg_weight_high_score=TRACK_EG_HIGH,
+            eg_weight_low_score=TRACK_EG_LOW,
+            recover_hold_frames=TRACK_RECOVER_HOLD,
+            recover_sim_thresh=TRACK_RECOVER_SIM,
+            recover_max_center_dist=TRACK_RECOVER_DIST,
+            allow_bank_reclaim=TRACK_ALLOW_BANK_RECLAIM,
+            split_on_instance_change=TRACK_SPLIT_ON_CHANGE,
+        )
     print(f"[INFO] Tracker: {tracker}")
 
     # Track temp files so we can delete them all at the end. Each video

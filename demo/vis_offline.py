@@ -30,7 +30,7 @@ from predictions_io import load_detections, load_pairs
 # USER SETTINGS
 # ══════════════════════════════════════════════════════════════
 # Path to a predictions JSON exported by demo.py or demo_video.py.
-PREDICTIONS_JSON = 'demo/results/example_videos/food_tour.json'
+PREDICTIONS_JSON = 'Output/media0_cbiou.json'
 
 # Output: None -> demo/results/offline/<json_stem>/  (recommended)
 #         str  -> use that exact directory

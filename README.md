@@ -48,6 +48,19 @@ pip install timm==0.6.13 fairscale==0.4.6 scipy==1.7.3 yapf==0.40.1 \
 pip install lap filterpy
 ```
 
+### C-BIoU env (separate — required)
+
+Roboflow `trackers` needs **Python ≥ 3.10**, so it cannot live in `codetr`. Use a second env:
+
+```bash
+conda create -n cbiou python=3.10 -y
+conda activate cbiou
+pip install git+https://github.com/roboflow/trackers.git opencv-python-headless tqdm
+```
+
+You **cannot** run HOI-DETR inside `cbiou` without reinstalling the full detector stack. Compare trackers with a two-step workflow instead (below).
+
+
 Verify:
 
 ```bash
@@ -80,9 +93,13 @@ DEVICE       = 'cuda:0'
 INPUT_DIR    = 'path/to/videos'   # searched recursively
 OUTPUT_DIR   = 'Output'
 
-TRACKER = 'hybrid_sort_reid'      # or 'hybrid_sort' / None
-TRACK_ALLOW_BANK_RECLAIM = False  # do not reuse passed-object IDs
-TRACK_SPLIT_ON_CHANGE = True      # split when box size jumps (e.g. shelf → product)
+TRACKER = 'hybrid_sort_reid'      # or 'hybrid_sort' / 'cbiou' / None
+TRACK_ALLOW_BANK_RECLAIM = False  # HybridSORT: do not reuse passed-object IDs
+TRACK_SPLIT_ON_CHANGE = True      # HybridSORT: split on size jump (shelf → product)
+
+# When TRACKER = 'cbiou' (Roboflow; Python >= 3.10):
+# CBIOU_BUFFER_RATIO_FIRST = 0.1
+# CBIOU_BUFFER_RATIO_SECOND = 0.3
 ```
 
 Run:
@@ -105,7 +122,34 @@ Outputs per video:
 |-----------------|----------|
 | `hybrid_sort_reid` / `deep_hybrid_sort` | Hybrid-SORT-ReID using HOI embeddings |
 | `hybrid_sort` | Hybrid-SORT (TCM / weak cues, no ReID) |
+| `cbiou` | Use offline path below (`demo/track_cbiou_offline.py` in env `cbiou`) |
 | `None` / `'none'` | Detection + interaction only (no IDs) |
+
+### Side-by-side: HybridSORT vs C-BIoU (two envs)
+
+One Python process = one conda env. Keep detection in `codetr`, re-track with C-BIoU in `cbiou`:
+
+```bash
+# 1) Detect (+ optional HybridSORT) in codetr → writes Output/<name>.json
+conda activate codetr
+export PYTHONPATH=".:$PYTHONPATH"
+# TRACKER = 'hybrid_sort_reid'  or  None   in demo_video.py
+python demo/demo_video.py
+
+# 2) Replace track_ids with C-BIoU (same boxes / interactions)
+conda activate cbiou
+# edit INPUT_JSON in demo/track_cbiou_offline.py
+python demo/track_cbiou_offline.py
+# → writes Output/<name>_cbiou.json
+
+# 3) Re-render the C-BIoU JSON (draw_ui lives with HOI helpers)
+conda activate codetr
+# set PREDICTIONS_JSON to the *_cbiou.json in demo/vis_offline.py
+python demo/vis_offline.py
+```
+
+Tune `CBIOU_BUFFER_RATIO_FIRST` / `CBIOU_BUFFER_RATIO_SECOND` in `demo/track_cbiou_offline.py` (and the matching knobs in `demo_video.py` if you later run live C-BIoU on Python ≥ 3.10).
+
 
 ### ID stability (defaults)
 

@@ -5,6 +5,7 @@ Usage:
     from hoi_trackers import build_tracker
     tracker = build_tracker('hybrid_sort_reid', det_thresh=0.3)
     tracker = build_tracker('hybrid_sort')      # no appearance
+    tracker = build_tracker('cbiou', buffer_ratio_first=0.1, buffer_ratio_second=0.3)
     tracker = build_tracker(None)               # disabled
 """
 
@@ -36,6 +37,7 @@ def build_tracker(name: Optional[str] = "hybrid_sort_reid", **kwargs) -> BaseTra
         'hybrid_sort'                      -> Hybrid-SORT (TCM, no ReID)
         'hybrid_sort_reid' / 'deep_hybrid_sort' / 'hybrid_sort_deep'
                                            -> Hybrid-SORT-ReID (Deep Hybrid SORT)
+        'cbiou' / 'c_biou' / 'c-biou'      -> Roboflow C-BIoU (box-only)
     """
     if name is None:
         return NoOpTracker()
@@ -43,9 +45,9 @@ def build_tracker(name: Optional[str] = "hybrid_sort_reid", **kwargs) -> BaseTra
     if key in ("", "none", "off", "disabled"):
         return NoOpTracker()
 
-    from .hybrid_sort import HybridSortTracker
-
     if key in ("hybrid_sort", "hybridsort"):
+        from .hybrid_sort import HybridSortTracker
+
         kwargs = dict(kwargs)
         kwargs["with_reid"] = False
         return HybridSortTracker(**kwargs)
@@ -58,11 +60,18 @@ def build_tracker(name: Optional[str] = "hybrid_sort_reid", **kwargs) -> BaseTra
         "hybrid_sort_deep",
         "deep_hybridsort",
     ):
+        from .hybrid_sort import HybridSortTracker
+
         kwargs = dict(kwargs)
         kwargs["with_reid"] = True
         return HybridSortTracker(**kwargs)
 
+    if key in ("cbiou", "c_biou", "c-biou", "cb_iou", "cascaded_biou"):
+        from .cbiou import CBIoUSortTracker
+
+        return CBIoUSortTracker(**kwargs)
+
     raise ValueError(
         f"Unknown tracker {name!r}. "
-        f"Supported: hybrid_sort_reid (deep), hybrid_sort, none."
+        f"Supported: hybrid_sort_reid (deep), hybrid_sort, cbiou, none."
     )
