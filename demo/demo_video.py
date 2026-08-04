@@ -13,7 +13,7 @@ interactions for every frame, alongside the mp4.
 Edit the variables at the top for your paths, then run:
     python demo/demo_video.py
 """
-
+#Initially it use Hybrid-SORT-ReID
 import glob
 import json
 import os
