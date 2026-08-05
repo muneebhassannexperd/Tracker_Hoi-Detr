@@ -1156,6 +1156,7 @@ class PickupPutbackEngine:
                 self._confirm_putback(episode, frame_idx)
 
     # -- confirmation ------------------------------------------------
+    #.....
 
     def _confirm_pickup(self, episode: Episode, frame_idx: int) -> None:
         episode.state = EP_HELD
