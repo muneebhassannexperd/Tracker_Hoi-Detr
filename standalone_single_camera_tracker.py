@@ -756,6 +756,8 @@ HAND_BUSY_GRACE_FRAMES: int = 90   # ~3s @30fps
 SETTLE_SPEED_PX: float = 8.0       # mean px/frame under this over SETTLE_FRAMES counts as "stopped"
 SETTLE_FRAMES: int = 8
 SEPARATION_PX: float = 60.0        # growth in hand-object offset magnitude counted as "separating"
+# How often to print putback fail diagnostics while HELD (every N frames per episode).
+PUTBACK_DEBUG_EVERY_N: int = 15
 
 # --- Lost sight of it / session end ---
 SESSION_END_FRAMES: int = 300      # ~10s @30fps with no evidence -> resolve as kept, stop waiting
@@ -874,6 +876,7 @@ class PickupPutbackEngine:
         self.last_event_frame: int = -10 ** 9  # far in the past, so no banner shows before any event
         # hand_track_id -> (episode_id it's carrying, frame it was last touched)
         self.hand_carrying: Dict[int, Tuple[int, int]] = {}
+        self._obs_by_track_id_cache: Dict[int, "TrackObservation"] = {}
 
     # -- hf link resolution ------------------------------------------------
 
@@ -1094,6 +1097,23 @@ class PickupPutbackEngine:
 
     # -- state transitions ------------------------------------------------
 
+    def _hand_is_inside_safe_roi(self, episode: Episode) -> bool:
+        """True if the hand's last known position depth is inside (positive) safe ROI."""
+        if not episode.hand_position_history:
+            return False
+        _, _, depth = episode.hand_position_history[-1]
+        return depth < 0  # depth = -safe_roi_distance; negative means inside/shelf-side
+
+    def _firstobject_visible_in_roi(self) -> bool:
+        """True if any firstobject detection is currently inside the safe ROI.
+
+        Used as corroboration for hand-only putback: if the hand returned to
+        the shelf empty, there won't be a new firstobject visible there."""
+        for obs in self._obs_by_track_id_cache.values():
+            if obs.class_name == "firstobject" and obs.in_safe_roi:
+                return True
+        return False
+
     def _hand_has_stopped_moving(self, episode: Episode) -> bool:
         if len(episode.hand_position_history) < SETTLE_FRAMES:
             return False
@@ -1120,6 +1140,80 @@ class PickupPutbackEngine:
         # either signal is enough once settled -- not stacked as two hurdles,
         # they're two independent ways of proving the same release
         return settled and (self._hand_diverging_from_object(episode) or self._recent_grip_transitioned_to_open(episode))
+
+    def _putback_checklist(self, episode: Episode, frame_idx: int, required_bar: float, enough_gap: bool, hand_only: bool = False) -> dict:
+        """Evaluate each putback gate and return a debug-friendly checklist."""
+        score = float(episode.outward_score)
+        score_ok = score <= -required_bar
+        settled = self._hand_has_stopped_moving(episode)
+        diverging = self._hand_diverging_from_object(episode)
+        grip_open = self._recent_grip_transitioned_to_open(episode)
+        obj_visible = None  # only checked for hand_only
+        if hand_only:
+            hand_inside_roi = self._hand_is_inside_safe_roi(episode)
+            obj_visible = self._firstobject_visible_in_roi()
+            # In hand-only mode the hand is actively moving inward during the
+            # putback — it never "settles" in the same frame window where the
+            # product is visible.  The product reappearing on the shelf
+            # (obj_visible) IS the release proof, replacing the settle gate.
+            release_ok = obj_visible and hand_inside_roi
+            all_ok = score_ok and release_ok and enough_gap
+        else:
+            release_ok = settled and (diverging or grip_open)
+            all_ok = score_ok and release_ok and enough_gap
+
+        failed = []
+        if not score_ok:
+            failed.append(
+                f"inward_score(need<={-required_bar:.1f}, got={score:.1f})"
+            )
+        if hand_only:
+            if not obj_visible:
+                failed.append("obj_visible_in_roi=False(no firstobject in safe ROI)")
+            if not hand_inside_roi:
+                failed.append("hand_inside_roi=False")
+        else:
+            if not settled:
+                failed.append("settled=False")
+            elif not (diverging or grip_open):
+                failed.append("release=False(no_diverge_and_no_open_grip)")
+        if not enough_gap:
+            gap_need = MIN_TRANSITION_GAP
+            gap_have = frame_idx - episode.last_transition_frame
+            failed.append(f"gap(need>={gap_need}, have={gap_have})")
+
+        return {
+            "all_ok": all_ok,
+            "failed": failed,
+            "score": score,
+            "required_bar": required_bar,
+            "score_ok": score_ok,
+            "settled": settled,
+            "diverging": diverging,
+            "grip_open": grip_open,
+            "release_ok": release_ok,
+            "enough_gap": enough_gap,
+            "contact_streak": episode.contact_streak,
+            "obj_visible_in_roi": obj_visible,
+        }
+
+    def _log_putback_status(self, episode: Episode, frame_idx: int, checklist: dict, force: bool = False) -> None:
+        """Print putback gate status (throttled unless force=True)."""
+        if not force and (frame_idx % PUTBACK_DEBUG_EVERY_N) != 0:
+            return
+        failed = checklist["failed"]
+        status = "PASS_ALL_GATES" if checklist["all_ok"] else ("FAIL: " + ", ".join(failed))
+        obj_vis = checklist.get("obj_visible_in_roi")
+        obj_tag = f" obj_vis_roi={obj_vis}" if obj_vis is not None else ""
+        logger.info(
+            f"[PUTBACK-CHECK] frame={frame_idx} episode={episode.episode_id} "
+            f"obj_track={episode.object_track_id} hand_track={episode.linked_hand_id} | "
+            f"score={checklist['score']:.1f} bar={checklist['required_bar']:.1f} "
+            f"score_ok={checklist['score_ok']} settled={checklist['settled']} "
+            f"diverging={checklist['diverging']} grip_open={checklist['grip_open']} "
+            f"gap_ok={checklist['enough_gap']} contact_streak={checklist['contact_streak']}"
+            f"{obj_tag} | {status}"
+        )
 
     def _evaluate_transition(self, episode: Episode, frame_idx: int) -> None:
         if episode.contact_start_frame is None:
@@ -1150,13 +1244,19 @@ class PickupPutbackEngine:
             # the grace period keeps resetting while genuinely still in hand
             self.hand_carrying[episode.linked_hand_id] = (episode.episode_id, frame_idx)
 
-            if (episode.outward_score <= -required_bar
-                    and self._then_settles_and_separates(episode)
-                    and enough_gap):
+            checklist = self._putback_checklist(episode, frame_idx, required_bar, enough_gap)
+            # Always log when close (score already inward enough) or on throttle.
+            force = checklist["score_ok"] or checklist["all_ok"]
+            self._log_putback_status(episode, frame_idx, checklist, force=force)
+
+            if checklist["all_ok"]:
+                logger.info(
+                    f"[PUTBACK-TRY] frame={frame_idx} episode={episode.episode_id} "
+                    f"all gates passed -> calling _confirm_putback"
+                )
                 self._confirm_putback(episode, frame_idx)
 
     # -- confirmation ------------------------------------------------
-    #.....
 
     def _confirm_pickup(self, episode: Episode, frame_idx: int) -> None:
         episode.state = EP_HELD
@@ -1220,6 +1320,10 @@ class PickupPutbackEngine:
     def _confirm_putback(self, episode: Episode, frame_idx: int) -> None:
         matched = self._resolve_ambiguous_return(episode, frame_idx)
         if matched is None:
+            logger.info(
+                f"[PUTBACK-BLOCKED] frame={frame_idx} episode={episode.episode_id} "
+                f"gates passed but ambiguous return unresolved (waiting)"
+            )
             return
         matched.state = EP_RESTING
         matched.outward_score = 0.0
@@ -1250,14 +1354,55 @@ class PickupPutbackEngine:
         for episode in list(self.episodes.values()):
             if episode.episode_id in self._touched_episode_ids_this_frame:
                 continue
-            # single camera: a gap here just means the hand/product briefly
-            # wasn't detected -- freeze, don't decay or reset, expected not an error
             episode.frames_since_seen += 1
+
+            # --- HELD + no hf link: try putback using the hand track alone ---
+            # After pickup the product is in hand outside ROI so HOI drops
+            # the hf link. But the hand itself is still tracked — if we can
+            # see it moving back inward, that's enough for putback evidence.
+            if episode.state == EP_HELD and episode.linked_hand_id is not None:
+                hand_obs = self._obs_by_track_id_cache.get(episode.linked_hand_id)
+                if hand_obs is not None:
+                    self._update_motion_evidence(episode, hand_obs, None, frame_idx)
+                    self._update_gesture_evidence(episode, hand_obs, frame_idx)
+
+                    anchor = episode.contact_start_frame or episode.last_transition_frame
+                    since_contact = frame_idx - anchor
+                    required_bar = graduated_bar(since_contact)
+                    enough_gap = (frame_idx - episode.last_transition_frame) >= MIN_TRANSITION_GAP
+
+                    checklist = self._putback_checklist(episode, frame_idx, required_bar, enough_gap, hand_only=True)
+                    force = checklist["score_ok"] or checklist["all_ok"]
+                    self._log_putback_status(episode, frame_idx, checklist, force=force)
+
+                    if checklist["all_ok"]:
+                        logger.info(
+                            f"[PUTBACK-TRY-HANDONLY] frame={frame_idx} episode={episode.episode_id} "
+                            f"all gates passed (hand-only, no hf link) -> calling _confirm_putback"
+                        )
+                        self._confirm_putback(episode, frame_idx)
+                        continue
+                else:
+                    if (frame_idx % PUTBACK_DEBUG_EVERY_N) == 0:
+                        logger.info(
+                            f"[PUTBACK-SKIP] frame={frame_idx} episode={episode.episode_id} "
+                            f"obj_track={episode.object_track_id} state=HELD, no hf link AND "
+                            f"hand_track={episode.linked_hand_id} not visible "
+                            f"frames_since_seen={episode.frames_since_seen} score={episode.outward_score:.1f}"
+                        )
+            elif episode.state == EP_HELD:
+                if (frame_idx % PUTBACK_DEBUG_EVERY_N) == 0:
+                    logger.info(
+                        f"[PUTBACK-SKIP] frame={frame_idx} episode={episode.episode_id} "
+                        f"obj_track={episode.object_track_id} state=HELD, no linked_hand "
+                        f"frames_since_seen={episode.frames_since_seen} score={episode.outward_score:.1f}"
+                    )
+
             if episode.state == EP_HELD and episode.frames_since_seen > SESSION_END_FRAMES:
                 self._resolve_as_kept(episode)
             elif (episode.state == EP_RESTING and episode.contact_streak == 0
                     and episode.frames_since_seen > RESTING_IDLE_DROP_FRAMES):
-                self.episodes.pop(episode.object_track_id, None)  # cheap GC, no info lost
+                self.episodes.pop(episode.object_track_id, None)
 
     # -- per-frame entry point ------------------------------------------------
 
@@ -1273,6 +1418,7 @@ class PickupPutbackEngine:
         SingleCameraTracker.update()."""
         self._touched_episode_ids_this_frame = set()
         obs_by_track_id = {o.local_track_id: o for o in observations}
+        self._obs_by_track_id_cache = obs_by_track_id
 
         for hand_track_id, object_track_id, link_conf in self._resolve_hf_links_to_tracks(frame_data, observations):
             if object_track_id is None:
