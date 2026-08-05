@@ -51,7 +51,7 @@ CHECKPOINT   = 'checkpoints/epoch_5.pth'
 DEVICE       = 'cuda:0'
 
 # Input: a directory of videos (searched recursively for nested folders).
-INPUT_DIR    = 'Test-Data/Batch-2'
+INPUT_DIR    = 'Test-Data/a0572235-5c2c-4b87-8b1b-21497ec349a2'
 
 # Output: None  -> demo/results/<basename(INPUT_DIR)>/  (recommended)
 #         str   -> use that exact directory (relative paths preserved)
@@ -89,7 +89,7 @@ EXPORT_JSON = True
 #       uses HOI-DETR decoder embeddings as appearance features
 #   'hybrid_sort'                           -> Hybrid-SORT (TCM / weak cues only)
 #   None / 'none'                           -> tracking disabled
-TRACKER      = 'hybrid_sort_reid'
+TRACKER      = None
 # Keep lost Hybrid tracks a bit; stable IDs are managed separately now.
 TRACK_MAX_AGE = 60
 TRACK_MIN_HITS = 1
