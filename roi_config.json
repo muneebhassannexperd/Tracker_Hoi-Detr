@@ -1,0 +1,99 @@
+{
+    "camera_id": 0,
+    "points": [
+      [
+        250.0,
+        403.0
+      ],
+      [
+        1916.0,
+        434.0
+      ],
+      [
+        1916.0,
+        1075.0
+      ],
+      [
+        258.0,
+        1075.0
+      ]
+    ],
+    "centroid": [
+      1078.473876953125,
+      746.4320068359375
+    ],
+    "outward_vector": [
+      0.025940608233213425,
+      0.9996634125709534
+    ],
+    "safe_polygon": [
+      [
+        405.0,
+        585.0
+      ],
+      [
+        1910.0,
+        541.0
+      ],
+      [
+        1914.0,
+        1072.0
+      ],
+      [
+        494.0,
+        1072.0
+      ]
+    ],
+    "safe_polygon_mode": "manual",
+    "edge_normals": [
+      [
+        0.018604222685098648,
+        -0.999826967716217
+      ],
+      [
+        1.0,
+        -0.0
+      ],
+      [
+        0.0,
+        1.0
+      ],
+      [
+        -0.9999291896820068,
+        0.011903918348252773
+      ]
+    ],
+    "warp_size": [
+      1920,
+      1080
+    ],
+    "homography_to_other": [
+      [
+        0.9705700847646762,
+        -0.011593264485121494,
+        -235.9844701041286
+      ],
+      [
+        0.004157682839781274,
+        0.8804322148188701,
+        105.88337536045509
+      ],
+      [
+        3.3147339734636295e-06,
+        -1.9468818175563948e-05,
+        0.9999999999999999
+      ]
+    ],
+    "homography_error_px": 0.0,
+    "homography_active": true,
+    "point_order": [
+      "top_left",
+      "top_right",
+      "bottom_right",
+      "bottom_left"
+    ],
+    "source_video": "/home/amina/Nexpred/Viatouch/Approach-3-v1/viatouch-cv-object-identification-pipeline/Videos/cam0_output_20260511_150045.mp4",
+    "reference_frame_index": 231,
+    "reference_frame_selector": "mid",
+    "reference_image": "config/roi/cam0_reference.jpg"
+  }
