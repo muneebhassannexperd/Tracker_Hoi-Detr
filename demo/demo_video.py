@@ -51,7 +51,7 @@ CHECKPOINT   = 'checkpoints/epoch_5.pth'
 DEVICE       = 'cuda:0'
 
 # Input: a directory of videos (searched recursively for nested folders).
-INPUT_DIR    = 'Test-Data/a0572235-5c2c-4b87-8b1b-21497ec349a2'
+INPUT_DIR    = 'Test-Data/73606fa4-93cd-4c63-adb8-900f436761f5'
 
 # Output: None  -> demo/results/<basename(INPUT_DIR)>/  (recommended)
 #         str   -> use that exact directory (relative paths preserved)
