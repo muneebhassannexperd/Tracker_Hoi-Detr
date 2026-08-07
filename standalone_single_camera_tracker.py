@@ -27,7 +27,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Sequence
+from typing import Dict, List, Optional, Tuple, Sequence
 
 import cv2
 import numpy as np
@@ -184,6 +184,55 @@ def crop_histogram_embedding(frame: np.ndarray, bbox: Tuple[float, float, float,
     return hist
 
 
+# Lazily-loaded pretrained CNN feature extractor for product appearance
+# comparison -- a color histogram (above) can't tell two different items
+# apart if they're similarly colored (confirmed empirically: two different
+# orange snack bags scored 0.73 cosine similarity via histogram, same as a
+# single item's own genuine continuity reading). A CNN feature captures
+# printed graphics/text/shape, not just color distribution, so it can
+# discriminate items a histogram can't. Loaded once, on first use, so
+# scripts that never touch appearance similarity (e.g. plain YOLO runs)
+# don't pay any model-loading cost.
+_CNN_EMBEDDER = None
+
+
+def _get_cnn_embedder():
+    global _CNN_EMBEDDER
+    if _CNN_EMBEDDER is None:
+        from torchvision.models import resnet18, ResNet18_Weights
+        model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        model.fc = torch.nn.Identity()  # penultimate (512-dim avgpool) output, no classifier
+        model.eval()
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        _CNN_EMBEDDER = (model, mean, std)
+    return _CNN_EMBEDDER
+
+
+def crop_cnn_embedding(frame: np.ndarray, bbox: Tuple[float, float, float, float]) -> np.ndarray:
+    """Extract a 512-dim ImageNet-pretrained ResNet18 feature vector from a
+    bounding box crop -- stronger than crop_histogram_embedding for telling
+    apart visually similar items, at the cost of a CNN forward pass."""
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(frame.shape[1], max(x1 + 1, x2))
+    y2 = min(frame.shape[0], max(y1 + 1, y2))
+
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return np.zeros(512, dtype=np.float32)
+
+    model, mean, std = _get_cnn_embedder()
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_LINEAR)
+    tensor = torch.from_numpy(resized).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+    tensor = (tensor - mean) / std
+    with torch.no_grad():
+        feat = model(tensor)
+    return feat.squeeze(0).numpy().astype(np.float32)
+
+
 # =============================================================================
 # 3. DATA CLASSES
 # =============================================================================
@@ -205,6 +254,7 @@ class Detection:
     original_centroid: Optional[np.ndarray] = None
     in_safe_roi_override: Optional[bool] = None
     in_outer_roi_override: Optional[bool] = None
+    cnn_embedding: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         self.centroid = np.array(
@@ -238,6 +288,7 @@ class LocalTrack:
     motion_centroid: Optional[np.ndarray] = None
     motion_velocity: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
     history: List[Tuple[float, float]] = field(default_factory=list)
+    last_cnn_embedding: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         self.history.append((float(self.centroid[0]), float(self.centroid[1])))
@@ -262,6 +313,7 @@ class LocalTrack:
 
         self.last_confidence = detection.confidence
         self.last_embedding = detection.embedding
+        self.last_cnn_embedding = detection.cnn_embedding
         self.last_frame_index = detection.frame_index
         self.last_timestamp_ms = detection.timestamp_ms
         self.missed_frames = 0
@@ -297,6 +349,7 @@ class TrackObservation:
     in_stable_roi: bool
     safe_roi_distance: float
     temporal_iou: float
+    cnn_embedding: Optional[np.ndarray] = None
 
 
 # =============================================================================
@@ -425,6 +478,9 @@ class SingleCameraTracker:
             in_stable_roi=in_stable_roi,
             safe_roi_distance=float(safe_dist),
             temporal_iou=track.temporal_iou,
+            cnn_embedding=(
+                track.last_cnn_embedding.copy() if track.last_cnn_embedding is not None else None
+            ),
         )
 
     def update(
@@ -472,6 +528,9 @@ class SingleCameraTracker:
                 centroid=detection.centroid.copy(),
                 last_confidence=detection.confidence,
                 last_embedding=detection.embedding.copy(),
+                last_cnn_embedding=(
+                    detection.cnn_embedding.copy() if detection.cnn_embedding is not None else None
+                ),
                 last_frame_index=detection.frame_index,
                 last_timestamp_ms=detection.timestamp_ms,
                 in_safe_roi_override=detection.in_safe_roi_override,
@@ -644,8 +703,13 @@ class HOIJsonDetector:
     elsewhere in this project; "secondobject" is not tracked here).
     """
 
-    def __init__(self, hoi_json_path: str, conf_threshold: float = 0.5) -> None:
+    def __init__(self, hoi_json_path: str, conf_threshold: float = 0.5, compute_cnn_embedding: bool = False) -> None:
         self.conf_threshold = conf_threshold
+        # off by default -- a real perf cost (CNN forward pass per firstobject
+        # crop per frame) for a signal proven NOT to help distinguish visually
+        # similar items (see project memory); kept opt-in for future retesting
+        # with a stronger/fine-tuned model, not enabled in normal runs.
+        self.compute_cnn_embedding = compute_cnn_embedding
         with open(hoi_json_path, "r", encoding="utf-8") as f:
             hoi_data = json.load(f)
         self.frames_by_idx: Dict[int, dict] = {
@@ -683,12 +747,19 @@ class HOIJsonDetector:
 
             bbox_tuple = tuple(float(v) for v in det["box"])
             embedding = crop_histogram_embedding(frame, bbox_tuple)
+            # CNN embedding only for firstobject -- hands don't need an
+            # appearance-identity check, and skipping them halves the compute.
+            cnn_embedding = (
+                crop_cnn_embedding(frame, bbox_tuple)
+                if class_name == "firstobject" and self.compute_cnn_embedding else None
+            )
             detections.append(Detection(
                 bbox=bbox_tuple,
                 class_id=int(det.get("class_id", 0)),
                 class_name=class_name,
                 confidence=score,
                 embedding=embedding,
+                cnn_embedding=cnn_embedding,
                 camera_id=camera_id,
                 frame_index=frame_index,
                 timestamp_ms=timestamp_ms,
@@ -708,15 +779,22 @@ class HOIJsonDetector:
 
 # =============================================================================
 # 6. PICKUP/PUTBACK ENGINE (HOI-DETR Episode logic)
-#    Pickup and putback are symmetric, standalone counters:
-#      - Pickup:  hf link + touch + outward motion (score >= +bar)
-#      - Putback: hf link + touch + inward motion  (score <= -bar)
-#    No pairing between them -- putback does not cancel a prior pickup.
+#    Implements HOI_DETR_Pickup_Putback_Pseudocode.md as real code, wired to
+#    this file's own SingleCameraTracker/TrackObservation/HOIJsonDetector --
+#    the two-zone-plus-margin ROI signals (in_safe_roi/in_outer_roi/
+#    in_stable_roi/safe_roi_distance) are consumed directly from
+#    TrackObservation rather than re-deriving a single-line ROI model.
+#
+#    NOTE: the numeric tunables below (CONTACT_K1, PICKUP_BAR_*, MIN_TRANSITION_GAP,
+#    etc.) are initial defaults carried over from the pseudocode design, not yet
+#    validated against real footage -- same open item flagged in the original
+#    diagnosis doc ("exact refractory window length ... need tuning against real
+#    footage"). Tune them once this is actually run against real sessions.
 # =============================================================================
 
 # --- Contact (touch) evidence ---
 CONTACT_FLOOR: float = 0.35        # min hf link_conf to count as "touching" this frame
-CONTACT_K1: int = 5                # consecutive touching frames required to leave RESTING
+CONTACT_K1: int = 3                # consecutive touching frames required to leave RESTING
 
 # --- Motion evidence (ROI-boundary depth, hand-primary) ---
 MOTION_WINDOW: int = 5             # frames back for the hand_delta comparison
@@ -745,8 +823,16 @@ NOISE_FLOOR: float = 5.0           # outward_score below this when contact drops
 HAND_BUSY_BAR_MULTIPLIER: float = 1.6
 HAND_BUSY_GRACE_FRAMES: int = 90   # ~3s @30fps
 
-# --- Episode garbage collection ---
+# --- Lost sight of it / session end ---
+SESSION_END_FRAMES: int = 300      # ~10s @30fps with no evidence -> resolve as kept, stop waiting
 RESTING_IDLE_DROP_FRAMES: int = 30 # RESTING + zero contact_streak this long -> safe to garbage-collect
+# A partial, incomplete grab attempt (TRANSITIONING, never reached HELD) that
+# then goes quiet this long is treated as abandoned -- reset to RESTING so a
+# later, unrelated touch on the same object_track_id starts completely
+# fresh instead of inheriting stale partial evidence (see
+# _handle_missing_evidence). Found empirically: a real gap of 43 frames
+# between two genuinely separate grabs sharing one track_id.
+TRANSITIONING_IDLE_RESET_FRAMES: int = 30
 
 # --- Track-reassignment reconciliation ---
 # The underlying SingleCameraTracker's own local track ID can break and
@@ -759,6 +845,16 @@ RESTING_IDLE_DROP_FRAMES: int = 30 # RESTING + zero contact_streak this long -> 
 # it's a close, recent match.
 REASSIGN_MAX_GAP_FRAMES: int = 90     # ~3s @30fps -- only reconcile a short gap
 REASSIGN_PROXIMITY_PX: float = 120.0  # candidate must be spatially close to the last known position
+# A second, independent bound: distance from the episode's ORIGIN position
+# (recorded once at creation, never updated) -- not just the last hop. Tried
+# just loosening REASSIGN_PROXIMITY_PX for HELD candidates first (an item
+# actively carried/examined can legitimately jump ~500px in ~30 frames), but
+# that alone let a chain of individually-plausible per-hop jumps drift
+# arbitrarily far over many frames (measured: one episode chain-reassigned
+# across nearly an entire session, merging clearly-different items). This
+# anchors every hop back to where the episode actually started, regardless
+# of how many reassignments happened in between.
+REASSIGN_ORIGIN_PROXIMITY_PX: float = 700.0
 
 # --- hf link (raw HOI-DETR box pair) -> live TrackObservation resolution ---
 HF_TRACK_MATCH_IOU: float = 0.3
@@ -777,6 +873,21 @@ GRIP_UNKNOWN = "UNKNOWN"
 
 EP_RESTING = "RESTING"
 EP_TRANSITIONING = "TRANSITIONING"
+EP_HELD = "HELD"
+
+# How far the hand must retreat from the deepest point it reached (while
+# HELD, no active hf-link) before _check_hand_empty_return treats it as a
+# genuine release rather than noise/repositioning -- see that function.
+HAND_RETREAT_MARGIN_PX: float = 150.0
+
+# --- Settle-and-separate (putback confirmation) ---
+SETTLE_SPEED_PX: float = 8.0       # mean px/frame under this over SETTLE_FRAMES counts as "stopped"
+SETTLE_FRAMES: int = 8
+SEPARATION_PX: float = 60.0        # growth in hand-object offset magnitude counted as "separating"
+# How close the object must reappear to its own origin_position (recorded
+# once at episode creation) to count as "back where it started" -- see
+# _check_object_only_return.
+OBJECT_ORIGIN_RETURN_PX: float = 150.0
 
 
 def graduated_bar(since_contact: int) -> float:
@@ -815,11 +926,11 @@ def _entry_n_back(history: Sequence[Tuple], n: int) -> Optional[Tuple]:
 
 @dataclass
 class Episode:
-    """Tracks one hand<->object interaction on a single object_track_id.
-    Pickup and putback are independent events: either can fire from
-    TRANSITIONING when outward_score crosses +/- bar. After a putback,
-    putback_done locks further putbacks on this episode/object track;
-    pickup still resets and can fire again as before."""
+    """One persistent belief about one physical object, keyed by the
+    tracker's own object_track_id. Survives brief detection gaps and
+    per-frame confidence flicker -- the direct structural fix for the two
+    confirmed production bugs (flicker with no debounce; a putback with no
+    matching pickup)."""
     episode_id: int
     object_track_id: int
     state: str = EP_RESTING
@@ -834,7 +945,31 @@ class Episode:
     outward_score: float = 0.0
     frames_since_seen: int = 0
     product_name: Optional[str] = None
-    putback_done: bool = False  # at most one putback per object track / episode
+    # set once, at episode creation, never updated -- an anchor for bounding
+    # total reassignment drift (see _reassign_matching_episode), independent
+    # of how many individual reassignment hops have happened since
+    origin_position: Optional[Tuple[float, float]] = None
+    # appearance at episode creation, for distinguishing "the same physical
+    # item reappearing near origin" from "a different item now sitting in
+    # the same slot" -- see near_origin's appearance gate below. origin_embedding
+    # (color histogram) proved unable to separate similarly-colored items;
+    # origin_cnn_embedding (ResNet18 features) is the stronger follow-up.
+    origin_embedding: Optional[np.ndarray] = None
+    origin_cnn_embedding: Optional[np.ndarray] = None
+    # consecutive frames linked_hand_id hasn't been observed -- gates hand
+    # rebinding (see _resolve_current_hand_track_id) to a sustained absence,
+    # not a single missed-detection frame
+    hand_missing_frames: int = 0
+    # consecutive frames with NO hand of any kind visible (not just this
+    # episode's linked one) -- dedicated session-end signal, deliberately
+    # separate from frames_since_seen (which also gates object-reassignment
+    # eligibility and is expected to grow past SESSION_END_FRAMES routinely
+    # while a hand is still being actively watched)
+    frames_since_any_hand_seen: int = 0
+    # was this episode's hand-return check skipped last time it ran because
+    # the shared hand was busy with a different episode? (see
+    # _check_hand_empty_return's busy-block-just-lifted reset)
+    was_hand_busy_blocked: bool = False
 
 
 class PickupPutbackEngine:
@@ -846,6 +981,7 @@ class PickupPutbackEngine:
         self.episodes: Dict[int, Episode] = {}   # keyed by object_track_id
         self._episode_id_counter = itertools.count(1)
         self._touched_episode_ids_this_frame: set = set()
+        self._touched_hand_ids_this_frame: set = set()
         self._hand_aspect_baseline: Dict[int, deque] = {}
         self.pickups: List[dict] = []
         self.putbacks: List[dict] = []
@@ -853,8 +989,6 @@ class PickupPutbackEngine:
         self.last_event_frame: int = -10 ** 9  # far in the past, so no banner shows before any event
         # hand_track_id -> (episode_id it's carrying, frame it was last touched)
         self.hand_carrying: Dict[int, Tuple[int, int]] = {}
-        # Survives episode GC/recreate: same object_track_id never putbacks twice
-        self._putback_done_object_ids: Set[int] = set()
 
     # -- hf link resolution ------------------------------------------------
 
@@ -943,6 +1077,16 @@ class PickupPutbackEngine:
             dist = float(np.linalg.norm(np.array(last_pos) - object_obs.centroid))
             if dist > REASSIGN_PROXIMITY_PX:
                 continue
+            # bound TOTAL drift from where this episode started, not just
+            # the last hop -- each individual reassignment can look locally
+            # plausible (small last-hop distance) while a chain of them
+            # drifts arbitrarily far over many frames, merging clearly
+            # different items together (measured: one episode chain-
+            # reassigned across nearly an entire session before this check).
+            if episode.origin_position is not None:
+                origin_dist = float(np.linalg.norm(np.array(episode.origin_position) - object_obs.centroid))
+                if origin_dist > REASSIGN_ORIGIN_PROXIMITY_PX:
+                    continue
             if best_dist is None or dist < best_dist:
                 best_episode, best_dist, best_gap = episode, dist, gap
 
@@ -981,8 +1125,11 @@ class PickupPutbackEngine:
                 return matched
 
         episode = Episode(episode_id=next(self._episode_id_counter), object_track_id=object_track_id)
-        if object_track_id in self._putback_done_object_ids:
-            episode.putback_done = True
+        if object_obs is not None:
+            episode.origin_position = (float(object_obs.centroid[0]), float(object_obs.centroid[1]))
+            episode.origin_embedding = object_obs.embedding.copy()
+            if object_obs.cnn_embedding is not None:
+                episode.origin_cnn_embedding = object_obs.cnn_embedding.copy()
         self.episodes[object_track_id] = episode
         return episode
 
@@ -1077,15 +1224,46 @@ class PickupPutbackEngine:
 
     # -- state transitions ------------------------------------------------
 
-    def _reset_episode_after_event(self, episode: Episode, frame_idx: int) -> None:
-        """Return episode to RESTING so the same track can fire again later."""
-        episode.state = EP_RESTING
-        episode.outward_score = 0.0
-        episode.contact_streak = 0
-        episode.contact_start_frame = None
-        episode.last_transition_frame = frame_idx
+    def _hand_has_stopped_moving(self, episode: Episode) -> bool:
+        if len(episode.hand_position_history) < SETTLE_FRAMES:
+            return False
+        recent = list(episode.hand_position_history)[-SETTLE_FRAMES:]
+        speeds = [
+            float(np.linalg.norm(np.array(recent[i][1]) - np.array(recent[i - 1][1])))
+            for i in range(1, len(recent))
+        ]
+        return bool(np.mean(speeds) <= SETTLE_SPEED_PX) if speeds else False
 
-    def _evaluate_transition(self, episode: Episode, frame_idx: int) -> None:
+    def _hand_diverging_from_object(self, episode: Episode) -> bool:
+        if len(episode.offset_history) < 2:
+            return False
+        recent = list(episode.offset_history)[-MOTION_WINDOW:]
+        mags = [float(np.linalg.norm(o)) for o in recent]
+        return bool(mags[-1] - mags[0] >= SEPARATION_PX)
+
+    def _recent_grip_transitioned_to_open(self, episode: Episode) -> bool:
+        readings = [r for _, r in list(episode.grip_history)[-5:]]
+        return GRIP_OPEN in readings
+
+    def _then_settles_and_separates(self, episode: Episode) -> bool:
+        settled = self._hand_has_stopped_moving(episode)
+        # either signal is enough once settled -- not stacked as two hurdles,
+        # they're two independent ways of proving the same release
+        return settled and (self._hand_diverging_from_object(episode) or self._recent_grip_transitioned_to_open(episode))
+
+    @staticmethod
+    def _appearance_similarity(episode: Episode, object_obs: Optional["TrackObservation"]) -> Optional[float]:
+        if episode.origin_embedding is None or object_obs is None:
+            return None
+        return cosine_similarity(episode.origin_embedding, object_obs.embedding)
+
+    @staticmethod
+    def _appearance_similarity_cnn(episode: Episode, object_obs: Optional["TrackObservation"]) -> Optional[float]:
+        if episode.origin_cnn_embedding is None or object_obs is None or object_obs.cnn_embedding is None:
+            return None
+        return cosine_similarity(episode.origin_cnn_embedding, object_obs.cnn_embedding)
+
+    def _evaluate_transition(self, episode: Episode, frame_idx: int, object_obs: Optional["TrackObservation"] = None) -> None:
         if episode.contact_start_frame is None:
             return
         since_contact = frame_idx - episode.contact_start_frame
@@ -1104,23 +1282,73 @@ class PickupPutbackEngine:
 
             if episode.outward_score >= required_bar and enough_gap:
                 self._confirm_pickup(episode, frame_idx)
-            elif episode.outward_score <= -required_bar and enough_gap:
-                if episode.putback_done or episode.object_track_id in self._putback_done_object_ids:
-                    logger.info(
-                        f"[PUTBACK-IGNORED] frame={frame_idx} episode={episode.episode_id} "
-                        f"object_track={episode.object_track_id} already put back once "
-                        f"(same episode/object id -- not counting again)"
-                    )
-                else:
-                    self._confirm_putback(episode, frame_idx)
-            elif episode.contact_streak == 0 and abs(episode.outward_score) < NOISE_FLOOR:
+            elif episode.contact_streak == 0 and episode.outward_score < NOISE_FLOOR:
                 episode.state = EP_RESTING
                 episode.outward_score = 0.0
                 episode.contact_start_frame = None
 
+        elif episode.state == EP_HELD:
+            # still being actively touched -- refresh the busy timestamp so
+            # the grace period keeps resetting while genuinely still in hand
+            self.hand_carrying[episode.linked_hand_id] = (episode.episode_id, frame_idx)
+
+            # crossed_back checks the hand's CURRENT absolute position, not
+            # outward_score's cumulative magnitude -- found empirically that
+            # outward_score can peak in the thousands during a long pickup
+            # (gesture/coupling bonuses apply asymmetrically between the
+            # outward and inward legs), so requiring it to fully unwind back
+            # past a small negative bar effectively never fires for a real
+            # return that doesn't retrace the exact same weighted path.
+            crossed_back = bool(episode.hand_position_history) and episode.hand_position_history[-1][2] <= 0
+
+            # Alternative trigger: the object itself reappearing right near
+            # where this episode started, on a freshly-touched frame. Covers
+            # the case where the object's own track drops out mid-hold (base
+            # tracker fails to bridge a real detection gap) and then a fresh
+            # hf-link resumes on the SAME frame the object reappears -- that
+            # resumption routes through this touched path, never through the
+            # missing-evidence fallback's own origin-return check (see
+            # _check_object_only_return), so it needs to be checked here too.
+            #
+            # Requires an actual gap in this episode's own object-position
+            # history right before this frame -- without it, near_origin was
+            # true on EVERY touched frame for any item that simply hadn't
+            # moved far from the shelf yet (the overwhelmingly common case in
+            # the first ~15 frames of a real, ongoing pickup), firing a
+            # putback while the hand was still actively holding the item.
+            # Confirmed empirically (51ca2c06_cam1 episode=1): --debug trace
+            # shows path=touched on every single frame from pickup(154)
+            # through the bogus putback(169) -- no gap, ever -- yet
+            # near_origin alone (gated only by MIN_TRANSITION_GAP) fired it.
+            reappeared_after_gap = (
+                len(episode.object_position_history) >= 2
+                and (frame_idx - episode.object_position_history[-2][0]) > 1
+            )
+            near_origin = (
+                reappeared_after_gap
+                and episode.object_position_history[-1][0] == frame_idx
+                and episode.origin_position is not None
+                and float(np.linalg.norm(
+                    np.array(episode.origin_position) - np.array(episode.object_position_history[-1][1])
+                )) <= OBJECT_ORIGIN_RETURN_PX
+            )
+            if near_origin:
+                logger.debug(
+                    f"[TRACE-APPEARANCE] episode={episode.episode_id} frame={frame_idx} "
+                    f"path=touched appearance_sim={self._appearance_similarity(episode, object_obs)} "
+                    f"appearance_sim_cnn={self._appearance_similarity_cnn(episode, object_obs)}"
+                )
+
+            if ((crossed_back and self._then_settles_and_separates(episode)) or near_origin) and enough_gap:
+                self._confirm_putback(episode, frame_idx)
+
     # -- confirmation ------------------------------------------------
 
     def _confirm_pickup(self, episode: Episode, frame_idx: int) -> None:
+        episode.state = EP_HELD
+        episode.last_transition_frame = frame_idx
+        episode.outward_score = 0.0
+        self.hand_carrying[episode.linked_hand_id] = (episode.episode_id, frame_idx)
         self.pickups.append({
             "episode_id": episode.episode_id,
             "frame": frame_idx,
@@ -1133,45 +1361,383 @@ class PickupPutbackEngine:
         )
         self.last_event_text = f"PICKUP CONFIRMED  episode={episode.episode_id}"
         self.last_event_frame = frame_idx
-        self.hand_carrying[episode.linked_hand_id] = (episode.episode_id, frame_idx)
-        self._reset_episode_after_event(episode, frame_idx)
         # product identity is intentionally NOT resolved here -- left to a
         # later, separate crop-extraction/identification step, per the design
 
     def _confirm_putback(self, episode: Episode, frame_idx: int) -> None:
-        """Standalone putback: mirror of pickup with inward motion. Not paired
-        to any prior pickup -- just counts how many putbacks happened.
-        At most one putback per object_track_id / episode (locks after first)."""
-        episode.putback_done = True
-        self._putback_done_object_ids.add(episode.object_track_id)
-        self.putbacks.append({
-            "episode_id": episode.episode_id,
-            "frame": frame_idx,
-            "hand_track_id": episode.linked_hand_id,
-            "object_track_id": episode.object_track_id,
-        })
-        logger.info(
-            f"[PUTBACK] episode={episode.episode_id} frame={frame_idx} "
-            f"hand_track={episode.linked_hand_id} object_track={episode.object_track_id}"
-        )
+        # NOTE: previously routed every call here through an ambiguous-return
+        # resolver that re-scored ALL currently-HELD episodes to guess which
+        # one was "really" returning. That was solving a problem this
+        # function never actually has: every caller (_check_hand_empty_return,
+        # _check_object_only_return, _evaluate_transition's HELD branch)
+        # already identifies THIS specific episode via evidence tied
+        # one-to-one to it (its own linked hand's motion, or its own object
+        # track) -- there's no genuine ambiguity to resolve. Confirmed
+        # empirically (f1a258bd_cam1): with two items held at once, the
+        # resolver's category/recency/proximity scores tied closely enough,
+        # frame after frame, that it silently dropped a fully-evidenced
+        # putback (retreat=172px past the required 150px bar) rather than
+        # ever confirming it, because episode 1's hand had separately died
+        # mid-video and stayed HELD forever, permanently polluting the
+        # "which held item is this" guess for every later return.
+        episode.state = EP_RESTING
+        episode.outward_score = 0.0
+        episode.contact_streak = 0
+        episode.contact_start_frame = None
+        episode.last_transition_frame = frame_idx
+        if self.hand_carrying.get(episode.linked_hand_id, (None, None))[0] == episode.episode_id:
+            self.hand_carrying.pop(episode.linked_hand_id, None)
+        self.putbacks.append({"episode_id": episode.episode_id, "frame": frame_idx})
+        logger.info(f"[PUTBACK] episode={episode.episode_id} frame={frame_idx}")
         self.last_event_text = f"PUTBACK CONFIRMED  episode={episode.episode_id}"
         self.last_event_frame = frame_idx
-        # Reset score/contact so pickup path stays unchanged; putback stays
-        # locked via putback_done / _putback_done_object_ids.
-        self._reset_episode_after_event(episode, frame_idx)
+        # a confirmed putback is a clean terminal event for this track id --
+        # structurally, HELD (and therefore a putback) is only reachable via
+        # a confirmed pickup, so an orphaned putback can't happen here
+        self.episodes.pop(episode.object_track_id, None)
 
     # -- missing evidence / session end ------------------------------------------------
 
-    def _handle_missing_evidence(self, frame_idx: int) -> None:
+    def _resolve_as_kept(self, episode: Episode) -> None:
+        # NOTE: previously inferred a putback here when the hand was last
+        # seen back inside the safe zone before evidence ran out (reasoning:
+        # more plausible than "kept" if placement was occluded right at the
+        # end). Reverted -- now that _check_hand_empty_return is a solid,
+        # directly-validated signal, this heuristic was doing more harm than
+        # good: a hand transiently passing near the ROI boundary on its way
+        # to the NEXT item (not placing anything down) triggered the same
+        # "last seen inside" condition, causing false putbacks (eeb4886b_cam1:
+        # 4 spurious ones, right where the customer picks several items in
+        # sequence). If a real return doesn't get caught by the direct check
+        # before session-end, resolving as kept is the safer default.
+        logger.info(
+            f"[SESSION-END] episode={episode.episode_id} object_track={episode.object_track_id} "
+            f"resolved as kept (no return seen for {episode.frames_since_seen} frames)"
+        )
+        self.episodes.pop(episode.object_track_id, None)
+
+    def _object_has_settled(self, episode: Episode) -> bool:
+        if len(episode.object_position_history) < SETTLE_FRAMES:
+            return False
+        recent = list(episode.object_position_history)[-SETTLE_FRAMES:]
+        speeds = [
+            float(np.linalg.norm(np.array(recent[i][1]) - np.array(recent[i - 1][1])))
+            for i in range(1, len(recent))
+        ]
+        return bool(np.mean(speeds) <= SETTLE_SPEED_PX) if speeds else False
+
+    def _has_reached_roi_since_held(self, episode: Episode) -> bool:
+        held_since = episode.last_transition_frame
+        return any(f >= held_since and depth <= 0 for f, _, depth in episode.hand_position_history)
+
+    def _check_hand_empty_return(self, episode: Episode, hand_obs: "TrackObservation", frame_idx: int) -> None:
+        """The hand this episode is linked to is still tracked (hands are
+        never ROI-restricted -- see the process_video_standalone filter) but
+        there's no active hf-link to this object THIS frame, i.e. the hand
+        isn't currently touching/holding it. The real physical signature of
+        a putback: the hand goes toward the machine/ROI while linked to the
+        product, then comes back out EMPTY. If we've already seen this hand
+        reach the safe zone while holding the item, and it's now moving back
+        outward without an active link, that's a direct, robust confirmation
+        -- doesn't depend on the object itself staying visible through the
+        actual moment of placement (it often isn't, occluded by the door/
+        shelf edge), and doesn't depend on outward_score's cumulative
+        magnitude (found to be unreliable -- see _evaluate_transition)."""
+        # If this hand is RECENTLY attributed to a DIFFERENT episode (still
+        # actively touching/carrying something else), its motion doesn't
+        # tell us anything about THIS episode's item -- the hand isn't
+        # necessarily empty, it's just busy elsewhere. Found empirically:
+        # without this gate, a hand moving on to a second item right after
+        # confirming the first pickup gets misread as "returning" the first
+        # item, since the hf-link for the first episode naturally goes quiet
+        # the moment attention shifts (eeb4886b_cam1: hand_track=2 carrying
+        # episode=2 from frame140 while episode=3's own hand-position check,
+        # still running because episode=3 got no fresh touches, wrongly
+        # fired a putback off that unrelated motion).
+        #
+        # Bounded by HAND_BUSY_GRACE_FRAMES, same as the pickup-side busy
+        # check -- without a time bound, once several episodes share one
+        # hand after a rebind (see _resolve_current_hand_track_id), whichever
+        # episode gets touched most recently permanently blocks every other
+        # one's check, forever, even long after that episode's own item was
+        # set down (found empirically: 26f0cc7c_cam1 -- episodes 2/4/5 never
+        # got a single chance to fire while episode=6 kept refreshing
+        # hand_carrying on its own unrelated touches).
+        busy = self.hand_carrying.get(episode.linked_hand_id)
+        if busy is not None and busy[0] != episode.episode_id and (frame_idx - busy[1]) <= HAND_BUSY_GRACE_FRAMES:
+            logger.debug(
+                f"[TRACE-HAND-RETURN] episode={episode.episode_id} frame={frame_idx} "
+                f"hand={episode.linked_hand_id} SKIPPED: busy with episode={busy[0]} since frame={busy[1]}"
+            )
+            episode.was_hand_busy_blocked = True
+            return
+        # same gate, but for the window BEFORE a new episode gets fully
+        # confirmed HELD: hand_carrying only updates on confirmation, so a
+        # hand actively reaching for (not yet confirmed) item #2 wouldn't
+        # show up there yet -- check this frame's raw touches directly too
+        # (found empirically: this exact gap caused a putback for episode N
+        # to fire the instant before episode N+1's pickup confirmed, off the
+        # hand's ordinary transit motion between two different items).
+        if episode.linked_hand_id in self._touched_hand_ids_this_frame:
+            logger.debug(
+                f"[TRACE-HAND-RETURN] episode={episode.episode_id} frame={frame_idx} "
+                f"hand={episode.linked_hand_id} SKIPPED: touching something this frame"
+            )
+            episode.was_hand_busy_blocked = True
+            return
+        # The busy-block above skips this function entirely while active --
+        # hand_position_history (maxlen=MOTION_WINDOW+1, just 6 entries) gets
+        # NO new samples for the whole blocked span, so its surviving entries
+        # are all from before the block started. Comparing today's depth_now
+        # against a min_depth_reached drawn from that stale window measures
+        # distance across an UNOBSERVED gap, not a genuine witnessed retreat
+        # -- and since every episode sharing that hand unblocks on the same
+        # frame, they'd all "confirm" off the same stale-distance artifact at
+        # once. Found empirically (eeb4886b_cam1): episodes 3/4/5/6 all fire
+        # PUTBACK on the single frame HAND_BUSY_GRACE_FRAMES lapses, each
+        # showing 700+px of "retreat" that was never actually observed
+        # happening. Clearing history on the block-lift edge forces retreat
+        # evidence to be earned fresh from this frame forward.
+        if episode.was_hand_busy_blocked:
+            episode.hand_position_history.clear()
+            episode.was_hand_busy_blocked = False
+
+        depth_now = -hand_obs.safe_roi_distance
+        episode.hand_position_history.append(
+            (frame_idx, (float(hand_obs.centroid[0]), float(hand_obs.centroid[1])), depth_now)
+        )
+        if not self._has_reached_roi_since_held(episode):
+            logger.debug(
+                f"[TRACE-HAND-RETURN] episode={episode.episode_id} frame={frame_idx} "
+                f"hand={hand_obs.local_track_id} depth_now={depth_now:.1f} "
+                f"reached_roi_since_held=False (never dipped <=0 since held)"
+            )
+            return
+
+        # Require a real, substantial retreat from the DEEPEST point reached
+        # since being held -- not just any small uptick from the immediately
+        # previous sample. Found empirically: a hand can wobble ~20px outward
+        # while still deep inside the safe zone (adjusting grip, checking the
+        # item against another) without genuinely releasing anything; that
+        # noise was firing false putbacks. A real release means the hand
+        # actually heads back toward/past the boundary, not a minor jitter
+        # near the bottom of a dip.
+        held_since = episode.last_transition_frame
+        min_depth_reached = min(
+            depth for f, _, depth in episode.hand_position_history if f >= held_since
+        )
+        retreated_enough = (depth_now - min_depth_reached) >= HAND_RETREAT_MARGIN_PX
+
+        enough_gap = (frame_idx - episode.last_transition_frame) >= MIN_TRANSITION_GAP
+        logger.debug(
+            f"[TRACE-HAND-RETURN] episode={episode.episode_id} frame={frame_idx} "
+            f"hand={hand_obs.local_track_id} depth_now={depth_now:.1f} "
+            f"min_depth_reached={min_depth_reached:.1f} retreat={(depth_now - min_depth_reached):.1f} "
+            f"retreated_enough={retreated_enough} enough_gap={enough_gap}"
+        )
+        if retreated_enough and enough_gap:
+            # When several episodes share this hand (customer handling
+            # multiple items in sequence), they all track the SAME physical
+            # hand and so all compute IDENTICAL retreat evidence -- without
+            # this, the first crossing confirms every one of them at once,
+            # collapsing what's actually several distinct dip-in/come-out
+            # cycles (one per item, spaced tens of frames apart) into a
+            # single instant. Found empirically (26f0cc7c_cam1): ground-truth
+            # putbacks are 6 separate events ~40-60 frames apart; the shared-
+            # hand evidence alone put all of them at one frame. Only the
+            # OLDEST still-held episode on this hand gets credited for THIS
+            # crossing; the rest are reset to require their own later one.
+            siblings = [
+                e for e in self.episodes.values()
+                if e.linked_hand_id == episode.linked_hand_id and e.state == EP_HELD
+            ]
+            oldest = min(siblings, key=lambda e: e.last_transition_frame)
+            if episode.episode_id != oldest.episode_id:
+                logger.debug(
+                    f"[TRACE-HAND-RETURN] episode={episode.episode_id} frame={frame_idx} "
+                    f"retreat evidence met but deferring to older sibling episode={oldest.episode_id}"
+                )
+                return
+            self._confirm_putback(episode, frame_idx)
+            for sibling in siblings:
+                if sibling.episode_id != episode.episode_id:
+                    sibling.hand_position_history.clear()
+
+    def _check_object_only_return(self, episode: Episode, object_obs: "TrackObservation", frame_idx: int) -> None:
+        """Secondary fallback for when the object happens to still be
+        tracked (product tracking is ROI-restricted, so this rarely fires
+        for a held item carried outside the ROI -- _check_hand_empty_return
+        is the primary putback signal and runs first) but isn't hf-linked to
+        a hand THIS frame -- grip not registered, or the hand has already
+        released it."""
+        episode.object_position_history.append(
+            (frame_idx, (float(object_obs.centroid[0]), float(object_obs.centroid[1])))
+        )
+        if not object_obs.in_stable_roi:
+            return
+
+        # Reappearing close to where this episode STARTED is itself strong,
+        # simple evidence of a return -- an alternative to the settle check,
+        # not a replacement (either is sufficient). Needed because a real
+        # detection gap in the middle of a hold (item briefly occluded
+        # during the actual moment of placement) leaves too few consecutive,
+        # closely-spaced position samples for _object_has_settled's velocity
+        # calculation to mean anything -- found empirically (26f0cc7c_cam1):
+        # object_track=7 vanishes from detection entirely for ~41 frames
+        # (264-305, mid-placement occlusion), then reappears within ~34px of
+        # its own origin_position, before climbing again on a second, later
+        # grab. That reappearance-near-origin is a clean, direct signal on
+        # its own, even with only one fresh sample after the gap.
+        near_origin = (
+            episode.origin_position is not None
+            and float(np.linalg.norm(np.array(episode.origin_position) - object_obs.centroid)) <= OBJECT_ORIGIN_RETURN_PX
+        )
+
+        enough_gap = (frame_idx - episode.last_transition_frame) >= MIN_TRANSITION_GAP
+        logger.debug(
+            f"[TRACE-OBJECT-RETURN] episode={episode.episode_id} frame={frame_idx} "
+            f"object={object_obs.local_track_id} near_origin={near_origin} "
+            f"settled={self._object_has_settled(episode)} enough_gap={enough_gap} "
+            f"appearance_sim={self._appearance_similarity(episode, object_obs)} "
+            f"appearance_sim_cnn={self._appearance_similarity_cnn(episode, object_obs)}"
+        )
+        if (near_origin or self._object_has_settled(episode)) and enough_gap:
+            self._confirm_putback(episode, frame_idx)
+
+    def _resolve_current_hand_track_id(
+        self, episode: Episode, obs_by_track_id: Dict[int, "TrackObservation"], frame_idx: int
+    ) -> Optional[int]:
+        """episode.linked_hand_id can reference a hand track that's since
+        died (purged after a >45-frame gap) -- the SAME physical hand often
+        reappears under a brand new ID rather than two different hands being
+        involved (confirmed visually: 26f0cc7c_cam1's hand_track=2 does the
+        early pickups and ends at frame340; hand_track=8 starts at frame387,
+        a plain re-ID gap, then goes on to do ALL the later returns -- for
+        items that hand_track=2 itself picked up). Without this, a putback
+        can never be detected once the original hand's track ID changes,
+        even though the physical hand is still right there. Only rebinds
+        when there's exactly one other active hand this frame -- with two
+        hands genuinely in play, guessing which one is "the" hand risks
+        attributing the wrong hand's motion to this episode."""
+        if episode.linked_hand_id in obs_by_track_id:
+            episode.hand_missing_frames = 0
+            return episode.linked_hand_id
+
+        episode.hand_missing_frames += 1
+        if episode.hand_missing_frames < LOCAL_TRACK_MAX_MISSES:
+            return None  # could still just be a brief gap -- wait it out
+
+        active_hands = [tid for tid, o in obs_by_track_id.items() if o.class_name == "hand"]
+        if len(active_hands) == 1 and active_hands[0] != episode.linked_hand_id:
+            new_hand_id = active_hands[0]
+            logger.info(
+                f"[HAND-REBIND] episode={episode.episode_id} linked_hand "
+                f"{episode.linked_hand_id} -> {new_hand_id} (frame={frame_idx}, "
+                f"missing for {episode.hand_missing_frames}f)"
+            )
+            episode.linked_hand_id = new_hand_id
+            episode.hand_missing_frames = 0
+            # a rebind re-establishes a live path to observe the eventual
+            # return -- without this, frames_since_seen (accumulating since
+            # the ORIGINAL last touch, long before the rebind) can exceed
+            # SESSION_END_FRAMES and resolve the episode as "kept" before
+            # the newly-identified hand ever gets to its next return cycle
+            episode.frames_since_seen = 0
+            return new_hand_id
+        if episode.hand_missing_frames == LOCAL_TRACK_MAX_MISSES:
+            logger.debug(
+                f"[TRACE-HAND-RESOLVE] episode={episode.episode_id} frame={frame_idx} "
+                f"linked_hand={episode.linked_hand_id} unresolvable: active_hands={active_hands} "
+                f"(need exactly 1 other hand to rebind)"
+            )
+        return None
+
+    def _handle_missing_evidence(self, frame_idx: int, obs_by_track_id: Dict[int, "TrackObservation"]) -> None:
         for episode in list(self.episodes.values()):
             if episode.episode_id in self._touched_episode_ids_this_frame:
                 continue
             # single camera: a gap here just means the hand/product briefly
             # wasn't detected -- freeze, don't decay or reset, expected not an error
             episode.frames_since_seen += 1
-            if (episode.state == EP_RESTING and episode.contact_streak == 0
+
+            current_hand_id = None
+            if episode.state == EP_HELD:
+                # each of these may confirm a putback and flip episode.state
+                # to RESTING (and pop it from self.episodes) -- the state
+                # checks below naturally no-op for it in that case. Hand
+                # check first: it's the more direct, robust signal (see
+                # _check_hand_empty_return) and doesn't need the object
+                # itself to still be visible.
+                current_hand_id = self._resolve_current_hand_track_id(episode, obs_by_track_id, frame_idx)
+                hand_obs = obs_by_track_id.get(current_hand_id) if current_hand_id is not None else None
+                if hand_obs is not None:
+                    self._check_hand_empty_return(episode, hand_obs, frame_idx)
+                elif episode.frames_since_seen % 30 == 0:
+                    logger.debug(
+                        f"[TRACE-HAND-RETURN] episode={episode.episode_id} frame={frame_idx} "
+                        f"no hand_obs this frame (linked_hand={episode.linked_hand_id}, "
+                        f"missing_frames={episode.hand_missing_frames}) -- check skipped entirely"
+                    )
+
+                object_obs = obs_by_track_id.get(episode.object_track_id)
+                if object_obs is not None and episode.state == EP_HELD:
+                    self._check_object_only_return(episode, object_obs, frame_idx)
+
+            # Session-end waits for a SUSTAINED absence of any hand, using
+            # its own dedicated counter -- not frames_since_seen (which
+            # keeps its original meaning, also gating object-reassignment
+            # eligibility and is expected to grow past SESSION_END_FRAMES
+            # routinely while a hand is still being actively watched) and
+            # not a single-frame "is a hand visible RIGHT NOW" check (hand
+            # detection has ordinary frame-to-frame gaps even for a hand
+            # that's clearly still there -- checking only the current frame
+            # meant the very first incidental gap after frames_since_seen
+            # passed 301 triggered an immediate, premature give-up). Found
+            # empirically on 26f0cc7c_cam1: episode=2's retreat was
+            # genuinely in progress (122/150px, climbing) when both of the
+            # cruder checks fired early.
+            any_hand_visible = current_hand_id is not None or any(
+                o.class_name == "hand" for o in obs_by_track_id.values()
+            )
+            if any_hand_visible:
+                episode.frames_since_any_hand_seen = 0
+            else:
+                episode.frames_since_any_hand_seen += 1
+
+            if (episode.state == EP_HELD and episode.frames_since_seen > SESSION_END_FRAMES
+                    and episode.frames_since_any_hand_seen > SESSION_END_FRAMES):
+                self._resolve_as_kept(episode)
+            elif (episode.state == EP_RESTING and episode.contact_streak == 0
                     and episode.frames_since_seen > RESTING_IDLE_DROP_FRAMES):
                 self.episodes.pop(episode.object_track_id, None)  # cheap GC, no info lost
+            elif (episode.state == EP_RESTING and episode.contact_streak > 0
+                    and episode.frames_since_seen > RESTING_IDLE_DROP_FRAMES):
+                # a partial streak that never reached CONTACT_K1 (so never
+                # left RESTING at all) has the exact same staleness problem
+                # as the TRANSITIONING case below, just one step earlier --
+                # found empirically (26f0cc7c_cam1): object_track=7's first
+                # touch burst was only 3 frames (short of CONTACT_K1=5),
+                # then went quiet 43 frames, then got a fresh unrelated
+                # touch burst that continued counting from streak=3 instead
+                # of starting at 0, conflating two separate grabs into one.
+                episode.contact_streak = 0
+            elif (episode.state == EP_TRANSITIONING
+                    and episode.frames_since_seen > TRANSITIONING_IDLE_RESET_FRAMES):
+                # _evaluate_transition's own "false start" revert only runs
+                # on touched frames -- a partial, incomplete grab attempt
+                # that then goes quiet for a while never gets a chance to
+                # revert on its own, so its stale partial evidence just sits
+                # there and merges onto whatever touches this SAME object
+                # track eventually gets much later. Found empirically
+                # (26f0cc7c_cam1): object_track=7 carries a brief 3-frame
+                # touch (a real but incomplete reach), then goes silent for
+                # 43 frames, then gets an entirely separate, complete lift --
+                # without this reset, the two get counted as one pickup
+                # instead of two.
+                episode.state = EP_RESTING
+                episode.contact_streak = 0
+                episode.outward_score = 0.0
+                episode.contact_start_frame = None
 
     # -- per-frame entry point ------------------------------------------------
 
@@ -1186,6 +1752,7 @@ class PickupPutbackEngine:
         `observations` is this frame's TrackObservation list, straight from
         SingleCameraTracker.update()."""
         self._touched_episode_ids_this_frame = set()
+        self._touched_hand_ids_this_frame = set()
         obs_by_track_id = {o.local_track_id: o for o in observations}
 
         for hand_track_id, object_track_id, link_conf in self._resolve_hf_links_to_tracks(frame_data, observations):
@@ -1194,19 +1761,26 @@ class PickupPutbackEngine:
             object_obs = obs_by_track_id.get(object_track_id)
             episode = self._find_or_create_episode(object_track_id, object_obs, frame_idx)
             episode.linked_hand_id = hand_track_id  # always overwritten, never inherited
+            episode.hand_missing_frames = 0
             episode.frames_since_seen = 0
             self._touched_episode_ids_this_frame.add(episode.episode_id)
 
             hand_obs = obs_by_track_id.get(hand_track_id)
             if hand_obs is None:
                 continue
+            # hand is actively touching SOMETHING this frame, regardless of
+            # whether that object's own episode has been confirmed picked up
+            # yet -- used by _check_hand_empty_return so a hand reaching for
+            # the next item isn't misread as having emptied out the previous
+            # one during the window before the next pickup is confirmed
+            self._touched_hand_ids_this_frame.add(hand_track_id)
 
             self._update_contact_signal(episode, link_conf, frame_idx)
             self._update_motion_evidence(episode, hand_obs, object_obs, frame_idx)
             self._update_gesture_evidence(episode, hand_obs, frame_idx)
-            self._evaluate_transition(episode, frame_idx)
+            self._evaluate_transition(episode, frame_idx, object_obs)
 
-        self._handle_missing_evidence(frame_idx)
+        self._handle_missing_evidence(frame_idx, obs_by_track_id)
 
 
 # =============================================================================
@@ -1351,7 +1925,11 @@ def process_video_standalone(
 
     # Initialize Detector & Tracker
     if hoi_json_path:
-        detector = HOIJsonDetector(hoi_json_path=hoi_json_path, conf_threshold=conf_threshold)
+        detector = HOIJsonDetector(
+            hoi_json_path=hoi_json_path,
+            conf_threshold=conf_threshold,
+            compute_cnn_embedding=logger.isEnabledFor(logging.DEBUG),
+        )
     else:
         detector = YOLODetector(model_path=model_path, conf_threshold=conf_threshold)
     tracker = SingleCameraTracker(camera_id=camera_id)
@@ -1395,6 +1973,12 @@ def process_video_standalone(
             # exactly the context needed to tell two hands apart when the
             # active one switches, since two hands look near-identical by
             # color histogram alone without that positional evidence.
+            #
+            # Products stay strictly ROI-restricted, no exemption -- without
+            # this, the model can pick up other things in the background as
+            # false "firstobject" detections. Putback detection runs off the
+            # hand's position instead (see _check_hand_empty_return), which
+            # never needed the object to be visible outside the ROI at all.
             if roi_polygon is not None:
                 detections = [
                     d for d in detections
@@ -1520,11 +2104,14 @@ def parse_args():
     parser.add_argument("--roi", type=str, default=None, help="Optional path to ROI config JSON file.")
     parser.add_argument("--show", "-s", action="store_true", help="Display live preview window while processing.")
     parser.add_argument("--max-frames", type=int, default=None, help="Maximum number of frames to process.")
+    parser.add_argument("--debug", action="store_true", help="Verbose per-frame pickup/putback evidence tracing.")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
     process_video_standalone(
         input_video_path=args.input,
         output_video_path=args.output,
