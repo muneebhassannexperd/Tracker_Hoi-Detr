@@ -27,7 +27,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Sequence
+from typing import Dict, List, Optional, Set, Tuple, Sequence
 
 import cv2
 import numpy as np
@@ -817,8 +817,9 @@ def _entry_n_back(history: Sequence[Tuple], n: int) -> Optional[Tuple]:
 class Episode:
     """Tracks one hand<->object interaction on a single object_track_id.
     Pickup and putback are independent events: either can fire from
-    TRANSITIONING when outward_score crosses +/- bar, then the episode
-    resets to RESTING."""
+    TRANSITIONING when outward_score crosses +/- bar. After a putback,
+    putback_done locks further putbacks on this episode/object track;
+    pickup still resets and can fire again as before."""
     episode_id: int
     object_track_id: int
     state: str = EP_RESTING
@@ -833,6 +834,7 @@ class Episode:
     outward_score: float = 0.0
     frames_since_seen: int = 0
     product_name: Optional[str] = None
+    putback_done: bool = False  # at most one putback per object track / episode
 
 
 class PickupPutbackEngine:
@@ -851,6 +853,8 @@ class PickupPutbackEngine:
         self.last_event_frame: int = -10 ** 9  # far in the past, so no banner shows before any event
         # hand_track_id -> (episode_id it's carrying, frame it was last touched)
         self.hand_carrying: Dict[int, Tuple[int, int]] = {}
+        # Survives episode GC/recreate: same object_track_id never putbacks twice
+        self._putback_done_object_ids: Set[int] = set()
 
     # -- hf link resolution ------------------------------------------------
 
@@ -977,6 +981,8 @@ class PickupPutbackEngine:
                 return matched
 
         episode = Episode(episode_id=next(self._episode_id_counter), object_track_id=object_track_id)
+        if object_track_id in self._putback_done_object_ids:
+            episode.putback_done = True
         self.episodes[object_track_id] = episode
         return episode
 
@@ -1099,7 +1105,14 @@ class PickupPutbackEngine:
             if episode.outward_score >= required_bar and enough_gap:
                 self._confirm_pickup(episode, frame_idx)
             elif episode.outward_score <= -required_bar and enough_gap:
-                self._confirm_putback(episode, frame_idx)
+                if episode.putback_done or episode.object_track_id in self._putback_done_object_ids:
+                    logger.info(
+                        f"[PUTBACK-IGNORED] frame={frame_idx} episode={episode.episode_id} "
+                        f"object_track={episode.object_track_id} already put back once "
+                        f"(same episode/object id -- not counting again)"
+                    )
+                else:
+                    self._confirm_putback(episode, frame_idx)
             elif episode.contact_streak == 0 and abs(episode.outward_score) < NOISE_FLOOR:
                 episode.state = EP_RESTING
                 episode.outward_score = 0.0
@@ -1127,7 +1140,10 @@ class PickupPutbackEngine:
 
     def _confirm_putback(self, episode: Episode, frame_idx: int) -> None:
         """Standalone putback: mirror of pickup with inward motion. Not paired
-        to any prior pickup -- just counts how many putbacks happened."""
+        to any prior pickup -- just counts how many putbacks happened.
+        At most one putback per object_track_id / episode (locks after first)."""
+        episode.putback_done = True
+        self._putback_done_object_ids.add(episode.object_track_id)
         self.putbacks.append({
             "episode_id": episode.episode_id,
             "frame": frame_idx,
@@ -1140,6 +1156,8 @@ class PickupPutbackEngine:
         )
         self.last_event_text = f"PUTBACK CONFIRMED  episode={episode.episode_id}"
         self.last_event_frame = frame_idx
+        # Reset score/contact so pickup path stays unchanged; putback stays
+        # locked via putback_done / _putback_done_object_ids.
         self._reset_episode_after_event(episode, frame_idx)
 
     # -- missing evidence / session end ------------------------------------------------
