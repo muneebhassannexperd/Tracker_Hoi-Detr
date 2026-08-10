@@ -709,14 +709,22 @@ class HOIJsonDetector:
 # =============================================================================
 # 6. PICKUP/PUTBACK ENGINE (HOI-DETR Episode logic)
 #    Pickup and putback are symmetric, standalone counters:
-#      - Pickup:  hf link + touch + outward motion (score >= +bar)
-#      - Putback: hf link + touch + inward motion  (score <= -bar)
+#      - Pickup:  contact + outward motion (score >= +bar)
+#      - Putback: contact + inward motion  (score <= -bar)
+#    Contact = HOI hf link OR hand/object box overlap (hybrid).
 #    No pairing between them -- putback does not cancel a prior pickup.
 # =============================================================================
 
 # --- Contact (touch) evidence ---
-CONTACT_FLOOR: float = 0.35        # min hf link_conf to count as "touching" this frame
-CONTACT_K1: int = 5                # consecutive touching frames required to leave RESTING
+CONTACT_FLOOR: float = 0.25        # min hf link_conf to count as "touching" this frame
+CONTACT_K1: int = 3                # consecutive touching frames required to leave RESTING
+
+# --- Box-overlap contact (OR with hf when both boxes are tracked) ---
+# Catches frames where HOI omits/flickers the hf link but hand and product
+# boxes clearly intersect. Does not help when the object track is missing.
+OVERLAP_IOU_FLOOR: float = 0.08           # bbox IoU hand vs firstobject
+OVERLAP_INTER_HAND_FRAC: float = 0.20     # intersection area / hand box area
+OVERLAP_CONTACT_CONF: float = 0.50        # synthetic conf when overlap fires (>= CONTACT_FLOOR)
 
 # --- Motion evidence (ROI-boundary depth, hand-primary) ---
 MOTION_WINDOW: int = 5             # frames back for the hand_delta comparison
@@ -856,7 +864,7 @@ class PickupPutbackEngine:
         # Survives episode GC/recreate: same object_track_id never putbacks twice
         self._putback_done_object_ids: Set[int] = set()
 
-    # -- hf link resolution ------------------------------------------------
+    # -- contact link resolution (hf OR box overlap) -----------------------
 
     @staticmethod
     def _best_iou_match(box: Sequence[float], observations: List["TrackObservation"]) -> Optional["TrackObservation"]:
@@ -867,6 +875,25 @@ class PickupPutbackEngine:
             if iou > best_iou:
                 best_obs, best_iou = obs, iou
         return best_obs
+
+    @staticmethod
+    def _hand_object_overlap_score(
+        hand_box: Tuple[float, float, float, float],
+        object_box: Tuple[float, float, float, float],
+    ) -> Tuple[bool, float]:
+        """True if boxes overlap enough to count as geometric contact.
+        Uses IoU or intersection/hand-area (better when the product sits
+        mostly inside a larger hand box during a grip)."""
+        iou = bbox_iou(hand_box, object_box)
+        hx1, hy1, hx2, hy2 = hand_box
+        ox1, oy1, ox2, oy2 = object_box
+        ix1, iy1 = max(hx1, ox1), max(hy1, oy1)
+        ix2, iy2 = min(hx2, ox2), min(hy2, oy2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        hand_area = max(0.0, hx2 - hx1) * max(0.0, hy2 - hy1)
+        inter_hand = inter / hand_area if hand_area > 1e-6 else 0.0
+        ok = iou >= OVERLAP_IOU_FLOOR or inter_hand >= OVERLAP_INTER_HAND_FRAC
+        return ok, max(iou, inter_hand)
 
     def _resolve_hf_links_to_tracks(
         self,
@@ -911,6 +938,66 @@ class PickupPutbackEngine:
                 link_conf,
             ))
         return links
+
+    def _resolve_overlap_links_to_tracks(
+        self,
+        observations: List["TrackObservation"],
+    ) -> List[Tuple[int, int, float]]:
+        """Geometric hand<->firstobject contact from live track boxes.
+        Best-overlapping object per hand (avoids multi-shelf false pairs).
+        Hand must be in outer ROI so background people don't invent contact."""
+        hand_obs = [o for o in observations if o.class_name == "hand"]
+        object_obs = [o for o in observations if o.class_name == "firstobject"]
+        if not hand_obs or not object_obs:
+            return []
+
+        links: List[Tuple[int, int, float]] = []
+        for hand in hand_obs:
+            if not hand.in_outer_roi:
+                continue
+            best_obj: Optional[TrackObservation] = None
+            best_score = -1.0
+            for obj in object_obs:
+                ok, score = self._hand_object_overlap_score(hand.bbox, obj.bbox)
+                if ok and score > best_score:
+                    best_obj, best_score = obj, score
+            if best_obj is not None:
+                links.append((
+                    hand.local_track_id,
+                    best_obj.local_track_id,
+                    OVERLAP_CONTACT_CONF,
+                ))
+        return links
+
+    def _resolve_contact_links(
+        self,
+        frame_data: Optional[dict],
+        observations: List["TrackObservation"],
+    ) -> List[Tuple[int, int, float]]:
+        """Union of hf links and box-overlap links.
+        Per (hand, object) keep the higher confidence. Overlap fills frames
+        where hf is missing or unresolved to a tracked object."""
+        merged: Dict[Tuple[int, int], float] = {}
+        hf_pairs: Set[Tuple[int, int]] = set()
+
+        for hand_id, object_id, conf in self._resolve_hf_links_to_tracks(frame_data, observations):
+            if object_id is None:
+                continue
+            key = (hand_id, object_id)
+            hf_pairs.add(key)
+            merged[key] = max(merged.get(key, 0.0), float(conf))
+
+        for hand_id, object_id, conf in self._resolve_overlap_links_to_tracks(observations):
+            key = (hand_id, object_id)
+            prev = merged.get(key, 0.0)
+            if key not in hf_pairs and conf >= CONTACT_FLOOR:
+                logger.debug(
+                    f"[CONTACT-OVERLAP] hand={hand_id} object={object_id} "
+                    f"conf={conf:.2f} (no hf pair this frame)"
+                )
+            merged[key] = max(prev, float(conf))
+
+        return [(h, o, c) for (h, o), c in merged.items()]
 
     # -- episode lookup ------------------------------------------------------
 
@@ -1184,13 +1271,11 @@ class PickupPutbackEngine:
         """One call per processed frame. `frame_data` is this frame's raw
         HOI-DETR entry (for its `hf` links, via HOIJsonDetector.get_frame_data);
         `observations` is this frame's TrackObservation list, straight from
-        SingleCameraTracker.update()."""
+        SingleCameraTracker.update(). Contact uses hf OR box overlap."""
         self._touched_episode_ids_this_frame = set()
         obs_by_track_id = {o.local_track_id: o for o in observations}
 
-        for hand_track_id, object_track_id, link_conf in self._resolve_hf_links_to_tracks(frame_data, observations):
-            if object_track_id is None:
-                continue
+        for hand_track_id, object_track_id, link_conf in self._resolve_contact_links(frame_data, observations):
             object_obs = obs_by_track_id.get(object_track_id)
             episode = self._find_or_create_episode(object_track_id, object_obs, frame_idx)
             episode.linked_hand_id = hand_track_id  # always overwritten, never inherited
