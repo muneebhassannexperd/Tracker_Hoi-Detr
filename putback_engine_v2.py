@@ -348,16 +348,19 @@ PUTBACK_MIN_FRAMES_OUT: int = 5
 # pick@392 — stay < that (use 110). Place stamp can be slightly earlier.
 PUTBACK_MIN_AFTER_PICKUP: int = 110     # block place during multi-item pick burst
 PUTBACK_MIN_PLACE_AFTER_PICKUP: int = 100  # place stamp itself must be after last pick
-# Soft place (no live FO) OK only late after last pick — multi-item re-entry
-# earlier than this is not a place (e7eea340@183). Real place cascades (eeb/180)
-# are well past this once puts start.
-PUTBACK_SOFT_PLACE_MIN_AFTER_PICK: int = 160
+# Soft place with *no* product_contact_seen is disabled (df9c244: empty-hand
+# re-pick was stamped as putback via SOFT_PLACE_MIN_AFTER_PICK alone). Occlusion
+# still OK only through the remembered-product branch (product_contact_seen).
+PUTBACK_SOFT_PLACE_MIN_AFTER_PICK: int = 160  # unused for stamp; kept for logs/compat
 PUTBACK_CONTACT_OFF: int = 2            # frames without hf after shelf contact
 PUTBACK_HAND_DEEP_FOR_CONTACT: float = 40.0  # slightly wider "at shelf"
 PUTBACK_DEPTH_MEMORY: int = 90          # seed carry-out evidence before arm
 PUTBACK_PLACE_MAX_AGE: int = 80         # allow full place-hold dwell before expire
 PUTBACK_MIN_SHELF_DWELL: int = 5        # frames at shelf after place before retreat counts
 PUTBACK_RETREAT_DEPTH: float = 100.0    # depth after leave counts as retreat
+# After a putback, only briefly block new pickups (shelf noise during place).
+# Permanent _put_phase blocked real re-picks on df9c244 (Issue C).
+PUT_PHASE_BLOCK_FRAMES: int = 45
 # Accept shelf contact if object is in_stable_roi OR simply in outer ROI OR
 # hand is deep enough that the slot is occluded but contact is still real.
 
@@ -398,14 +401,13 @@ class PickupEngineV2(PickupPutbackEngine):
         self._regrab_eligible: Dict[int, bool] = {}
         self._regrab_eligible_since: Dict[int, int] = {}
         self._last_pickup_frame: int = -10 ** 9
-        # Once any putback has fired, further pickups are blocked until clear
-        # leave-and-return pick cycle (prevents shelf noise during put cascade
-        # on the final cam1 ROI — e.g. 26f0 false PU@671 wiping middle putbacks).
+        # Briefly block new pickups after a putback (shelf noise during place
+        # cascade). Timed — not permanent (df9c244 Issue C).
         self._put_phase: bool = False
         self._last_putback_frame: int = -10 ** 9
 
     def sync_putbacks(self, putbacks: List[dict]) -> None:
-        """Feed putbacks so pick phase ends after first real place (session model)."""
+        """Feed putbacks so pickups are briefly deferred after a place."""
         for p in putbacks:
             f = int(p.get("frame", -1))
             if f < 0:
@@ -414,13 +416,16 @@ class PickupEngineV2(PickupPutbackEngine):
             self._last_putback_frame = max(self._last_putback_frame, f)
 
     def _should_block_new_pickup(self, frame_idx: int, kind: str = "normal") -> bool:
-        # Put cascade: refuse new grab events (object-in-shelf looks like a pick).
+        # Put cascade debounce only for PUT_PHASE_BLOCK_FRAMES after last putback.
         if self._put_phase:
-            logger.debug(
-                f"[PICKUP-v2] block {kind} frame={frame_idx} reason=put_phase "
-                f"last_pb={self._last_putback_frame}"
-            )
-            return True
+            if (frame_idx - self._last_putback_frame) > PUT_PHASE_BLOCK_FRAMES:
+                self._put_phase = False
+            else:
+                logger.debug(
+                    f"[PICKUP-v2] block {kind} frame={frame_idx} reason=put_phase "
+                    f"last_pb={self._last_putback_frame}"
+                )
+                return True
         # Debounce multi-hand / double HOI confirms under wide ROI.
         if (frame_idx - self._last_pickup_frame) < MIN_PICKUP_EVENT_GAP:
             logger.debug(
@@ -455,6 +460,8 @@ class PickupEngineV2(PickupPutbackEngine):
         if self._should_block_new_pickup(frame_idx, kind="normal"):
             return
         super()._confirm_pickup(episode, frame_idx)
+        # A confirmed pickup ends put-phase early (Issue C: allow later picks).
+        self._put_phase = False
         eid = episode.episode_id
         self._last_touch_frame[eid] = frame_idx
         self._burst_min_depth[eid] = 1e9
@@ -563,6 +570,9 @@ class PickupEngineV2(PickupPutbackEngine):
     ) -> None:
         self._touched_episode_ids_this_frame = set()
         obs_by_track_id = {o.local_track_id: o for o in observations}
+        live_fo_ids = {
+            o.local_track_id for o in observations if o.class_name == "firstobject"
+        }
 
         for hand_track_id, object_track_id, link_conf in resolve_hf_links_to_tracks(
             frame_data, observations
@@ -570,7 +580,9 @@ class PickupEngineV2(PickupPutbackEngine):
             if object_track_id is None:
                 continue
             object_obs = obs_by_track_id.get(object_track_id)
-            episode = self._find_or_create_episode(object_track_id, object_obs, frame_idx)
+            episode = self._find_or_create_episode(
+                object_track_id, object_obs, frame_idx, live_fo_ids
+            )
             episode.linked_hand_id = hand_track_id
             episode.frames_since_seen = 0
             self._touched_episode_ids_this_frame.add(episode.episode_id)
@@ -980,16 +992,16 @@ class PutbackDetectorV2:
                     and state.was_carried_out
                     and depth_now <= PUTBACK_HAND_DEEP_FOR_CONTACT
                     and (frame_idx - last_pu) >= PUTBACK_MIN_PLACE_AFTER_PICKUP
-                    and (
-                        state.product_contact_seen
-                        or (frame_idx - last_pu) >= PUTBACK_SOFT_PLACE_MIN_AFTER_PICK
-                    )
+                    # Issue B: never soft-place on empty hands. Require a product
+                    # seen this put session (live FO path / remembered-product
+                    # branch above). Time-since-pickup alone caused false puts.
+                    and state.product_contact_seen
                     and self._allow_place_stamp(
                         hand_obs, object_obs, state.product_contact_seen
                     )
                 ):
-                    # Soft place: product already seen THIS put, or long past last
-                    # pick (clear put phase — not mid multi-grab like e7ee@183).
+                    # Soft place only after product was seen this put session
+                    # (object box may have dropped; oid may be gone).
                     contact_ok = True
                     if state.contacted_object_track is None:
                         state.contacted_object_track = -1
@@ -1111,7 +1123,14 @@ class PutbackDetectorV2:
             # Pure door-handle pose: allow release only if we saw a real product
             # on this put session (then the hand often dips lower after place).
             door_now = hand_in_door_band(hand_obs) and not state.product_contact_seen
-            if door_now or not carried_enough or state.place_frame is None:
+            # Issue B: every confirm path needs product_contact_seen this put
+            # (blocks empty-hand re-pick → false PUTBACK on df9c244).
+            if (
+                door_now
+                or not carried_enough
+                or state.place_frame is None
+                or not state.product_contact_seen
+            ):
                 released = False
             elif retreated_out and (
                 state.release_armed or place_age >= PUTBACK_MIN_SHELF_DWELL
@@ -1131,10 +1150,6 @@ class PutbackDetectorV2:
                 and still_at_place
                 and not contact_ok
                 and place_age >= 10
-                # Mid-pick re-entries often "drop" HF on machine FO with no
-                # product contact (e7eea340 false put@183). Require a real
-                # product was seen before trusting link_drop alone.
-                and state.product_contact_seen
             ):
                 released = True
                 reason = "link_drop_at_shelf"

@@ -27,7 +27,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Sequence
+from typing import Dict, List, Optional, Set, Tuple, Sequence
 
 import cv2
 import numpy as np
@@ -651,16 +651,15 @@ class YOLODetector:
 #     running a live model -- swaps in for YOLODetector)
 # =============================================================================
 
-# Near-duplicate concurrent detections within a single frame -- measured
-# empirically across all 36 real HOI-DETR sessions available. For
-# "firstobject", same-frame same-class pairs closer than ~250px are almost
-# always one physical item double-detected (a clear valley in the real
-# distance histogram between a duplicate cluster peaking at 40-60px and a
-# genuinely-distinct-objects cluster starting at 280px+). Hands need a
-# DIFFERENT criterion: real distinct hands can legitimately sit as close as
-# ~18px apart (two-handed use), so distance would wrongly merge them --
-# IoU>0.5 is a near-perfect discriminator instead (only 0.08% of real
-# two-hand frames exceed it, and those few are all <=66px apart).
+# Near-duplicate concurrent detections within a single frame.
+# Same-frame dedupe: hands and firstobject both use IoU. Centroid distance
+# alone wrongly merges two real products held close (df9c244 parallel
+# Barebells: distinct boxes ~86px apart, IoU~0.14, but
+# FIRSTOBJECT_DEDUP_DIST_PX=250 suppressed the second FO so only one track
+# existed). True double-detects of one physical item almost always overlap
+# heavily (IoU > ~0.5); adjacent parallel picks do not.
+FIRSTOBJECT_DEDUP_IOU: float = 0.5
+# Kept for reference / older call sites; no longer used by dedupe.
 FIRSTOBJECT_DEDUP_DIST_PX: float = 250.0
 HAND_DEDUP_IOU: float = 0.5
 
@@ -676,6 +675,7 @@ def dedupe_same_frame_detections(detections: List["Detection"]) -> List["Detecti
     for class_name, dets in by_class.items():
         dets_sorted = sorted(dets, key=lambda d: -d.confidence)
         suppressed = [False] * len(dets_sorted)
+        iou_bar = HAND_DEDUP_IOU if class_name == "hand" else FIRSTOBJECT_DEDUP_IOU
         for i in range(len(dets_sorted)):
             if suppressed[i]:
                 continue
@@ -683,12 +683,7 @@ def dedupe_same_frame_detections(detections: List["Detection"]) -> List["Detecti
             for j in range(i + 1, len(dets_sorted)):
                 if suppressed[j]:
                     continue
-                if class_name == "hand":
-                    is_duplicate = bbox_iou(dets_sorted[i].bbox, dets_sorted[j].bbox) > HAND_DEDUP_IOU
-                else:
-                    dist = float(np.linalg.norm(dets_sorted[i].centroid - dets_sorted[j].centroid))
-                    is_duplicate = dist < FIRSTOBJECT_DEDUP_DIST_PX
-                if is_duplicate:
+                if bbox_iou(dets_sorted[i].bbox, dets_sorted[j].bbox) > iou_bar:
                     suppressed[j] = True
     return keep
 
@@ -844,6 +839,9 @@ TRANSITIONING_IDLE_RESET_FRAMES: int = 30
 # pickup) for the new ID, reconcile it back onto the existing episode when
 # it's a close, recent match.
 REASSIGN_MAX_GAP_FRAMES: int = 90     # ~3s @30fps -- only reconcile a short gap
+# Must have actually gone missing; gap=0 with two live FO tracks was merging
+# parallel products (df9c244 Barebells tracks 2↔4 ping-pong).
+REASSIGN_MIN_GAP_FRAMES: int = 3
 REASSIGN_PROXIMITY_PX: float = 120.0  # candidate must be spatially close to the last known position
 # A second, independent bound: distance from the episode's ORIGIN position
 # (recorded once at creation, never updated) -- not just the last hop. Tried
@@ -1053,13 +1051,19 @@ class PickupPutbackEngine:
         new_track_id: int,
         object_obs: "TrackObservation",
         frame_idx: int,
+        live_object_track_ids: Optional[Set[int]] = None,
     ) -> Optional[Episode]:
         """Before minting a brand new episode for an object_track_id never
         seen before, check whether it's really an existing episode's object
         continuing under a reassigned track ID -- a recent, spatially close
         episode that hasn't been touched since -- rather than a genuinely new
         interaction. Skips episodes with no accumulated progress (RESTING,
-        zero contact streak): nothing there worth preserving."""
+        zero contact streak): nothing there worth preserving.
+
+        Parallel products: if the episode's current track is still live this
+        frame, do NOT reassign (df9c244: tracks 2 and 4 both present ~86-110px
+        apart were incorrectly merged with gap=0)."""
+        live_ids = live_object_track_ids or set()
         best_episode = None
         best_dist = None
         best_gap = None
@@ -1070,7 +1074,12 @@ class PickupPutbackEngine:
                 continue
             if not episode.object_position_history:
                 continue
+            # Old track still observed this frame => second product, not ID break.
+            if episode.object_track_id in live_ids:
+                continue
             gap = episode.frames_since_seen
+            if gap < REASSIGN_MIN_GAP_FRAMES:
+                continue
             if gap > REASSIGN_MAX_GAP_FRAMES:
                 continue
             _, last_pos = episode.object_position_history[-1]
@@ -1108,6 +1117,7 @@ class PickupPutbackEngine:
         object_track_id: int,
         object_obs: Optional["TrackObservation"],
         frame_idx: int,
+        live_object_track_ids: Optional[Set[int]] = None,
     ) -> Episode:
         """Gates purely on 'is this object_track_id already claimed by an
         open episode' -- never on appearance -- which is what keeps
@@ -1120,7 +1130,9 @@ class PickupPutbackEngine:
             return episode
 
         if object_obs is not None:
-            matched = self._reassign_matching_episode(object_track_id, object_obs, frame_idx)
+            matched = self._reassign_matching_episode(
+                object_track_id, object_obs, frame_idx, live_object_track_ids
+            )
             if matched is not None:
                 return matched
 
@@ -1754,12 +1766,17 @@ class PickupPutbackEngine:
         self._touched_episode_ids_this_frame = set()
         self._touched_hand_ids_this_frame = set()
         obs_by_track_id = {o.local_track_id: o for o in observations}
+        live_fo_ids = {
+            o.local_track_id for o in observations if o.class_name == "firstobject"
+        }
 
         for hand_track_id, object_track_id, link_conf in self._resolve_hf_links_to_tracks(frame_data, observations):
             if object_track_id is None:
                 continue
             object_obs = obs_by_track_id.get(object_track_id)
-            episode = self._find_or_create_episode(object_track_id, object_obs, frame_idx)
+            episode = self._find_or_create_episode(
+                object_track_id, object_obs, frame_idx, live_fo_ids
+            )
             episode.linked_hand_id = hand_track_id  # always overwritten, never inherited
             episode.hand_missing_frames = 0
             episode.frames_since_seen = 0
